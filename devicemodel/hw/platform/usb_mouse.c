@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 #include "usb.h"
 #include "usbdi.h"
@@ -309,10 +308,10 @@ umouse_init(void *pdata, char *opt)
 }
 
 static int
-umouse_request(void *scarg, struct usb_data_xfer *xfer)
+umouse_request(void *scarg, struct usb_xfer *xfer)
 {
 	struct umouse_vdev *dev;
-	struct usb_data_xfer_block *data;
+	struct usb_block *data;
 	const char *str;
 	uint16_t value;
 	uint16_t index;
@@ -328,8 +327,6 @@ umouse_request(void *scarg, struct usb_data_xfer *xfer)
 	data = NULL;
 	udata = NULL;
 
-	assert(xfer != NULL && xfer->head >= 0);
-
 	idx = xfer->head;
 	for (i = 0; i < xfer->ndata; i++) {
 		xfer->data[idx].bdone = 0;
@@ -338,8 +335,8 @@ umouse_request(void *scarg, struct usb_data_xfer *xfer)
 			udata = data->buf;
 		}
 
-		xfer->data[idx].processed = USB_XFER_BLK_HANDLED;
-		idx = (idx + 1) % USB_MAX_XFER_BLOCKS;
+		xfer->data[idx].stat = USB_BLOCK_HANDLED;
+		idx = index_inc(idx, xfer->max_blk_cnt);
 	}
 
 	err = USB_ERR_NORMAL_COMPLETION;
@@ -693,16 +690,14 @@ done:
 }
 
 static int
-umouse_data_handler(void *scarg, struct usb_data_xfer *xfer, int dir,
+umouse_data_handler(void *scarg, struct usb_xfer *xfer, int dir,
 		    int epctx)
 {
 	struct umouse_vdev *dev;
-	struct usb_data_xfer_block *data;
+	struct usb_block *data;
 	uint8_t *udata;
 	int len, i, idx;
 	int err;
-
-	assert(xfer != NULL && xfer->head >= 0);
 
 	UPRINTF(LDBG, "handle data - DIR=%s|EP=%d, blen %d\r\n",
 		dir ? "IN" : "OUT", epctx, xfer->data[0].blen);
@@ -719,9 +714,9 @@ umouse_data_handler(void *scarg, struct usb_data_xfer *xfer, int dir,
 		if (data->buf != NULL && data->blen != 0)
 			break;
 
-		data->processed = USB_XFER_BLK_HANDLED;
+		data->stat = USB_BLOCK_HANDLED;
 		data = NULL;
-		idx = (idx + 1) % USB_MAX_XFER_BLOCKS;
+		idx = index_inc(idx, xfer->max_blk_cnt);
 	}
 	if (!data)
 		goto done;
@@ -759,7 +754,7 @@ umouse_data_handler(void *scarg, struct usb_data_xfer *xfer, int dir,
 		if (len > 0) {
 			dev->newdata = 0;
 
-			data->processed = USB_XFER_BLK_HANDLED;
+			data->stat = USB_BLOCK_HANDLED;
 			data->bdone += 6;
 			memcpy(udata, &dev->um_report, 6);
 			data->blen = len - 6;

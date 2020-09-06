@@ -3,6 +3,7 @@
 
 #include "macros.h"
 #include <stdint.h>
+#include <stdarg.h>
 #include <sched.h>
 #include <sys/types.h>
 
@@ -141,5 +142,7 @@ do_cpuid(u_int ax, u_int *p)
 	  (w)[6] = (uint8_t)((v) >> 48);    \
 	  (w)[7] = (uint8_t)((v) >> 56);    \
 } while (0)
+
+#define __packed       __attribute__((packed))
 
 #endif

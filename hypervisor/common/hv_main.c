@@ -4,48 +4,55 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
+#include <vm.h>
+#include <vm_reset.h>
+#include <vmcs.h>
+#include <vmexit.h>
+#include <irq.h>
 #include <schedule.h>
-#include <softirq.h>
+#include <profiling.h>
+#include <sprintf.h>
+#include <trace.h>
+#include <logmsg.h>
 
-void vcpu_thread(struct sched_object *obj)
+void vcpu_thread(struct thread_object *obj)
 {
-	struct acrn_vcpu *vcpu = list_entry(obj, struct acrn_vcpu, sched_obj);
+	struct acrn_vcpu *vcpu = container_of(obj, struct acrn_vcpu, thread_obj);
 	uint32_t basic_exit_reason = 0U;
 	int32_t ret = 0;
 
 	do {
-		/* If vcpu is not launched, we need to do init_vmcs first */
-		if (!vcpu->launched) {
-			init_vmcs(vcpu);
+		if (!is_lapic_pt_enabled(vcpu)) {
+			CPU_IRQ_DISABLE();
 		}
 
-		/* handle pending softirq when irq enable*/
-		do_softirq();
-		CPU_IRQ_DISABLE();
-		/* handle risk softirq when disabling irq*/
-		do_softirq();
+		/* Don't open interrupt window between here and vmentry */
+		if (need_reschedule(pcpuid_from_vcpu(vcpu))) {
+			schedule();
+		}
 
 		/* Check and process pending requests(including interrupt) */
 		ret = acrn_handle_pending_request(vcpu);
 		if (ret < 0) {
 			pr_fatal("vcpu handling pending request fail");
-			pause_vcpu(vcpu, VCPU_ZOMBIE);
+			get_vm_lock(vcpu->vm);
+			zombie_vcpu(vcpu, VCPU_ZOMBIE);
+			put_vm_lock(vcpu->vm);
+			/* Fatal error happened (triple fault). Stop the vcpu running. */
 			continue;
 		}
 
-		if (need_reschedule(vcpu->pcpu_id)) {
-			schedule();
-			continue;
-		}
-
+		reset_event(&vcpu->events[VCPU_EVENT_VIRTUAL_INTERRUPT]);
 		profiling_vmenter_handler(vcpu);
 
 		TRACE_2L(TRACE_VM_ENTER, 0UL, 0UL);
 		ret = run_vcpu(vcpu);
 		if (ret != 0) {
 			pr_fatal("vcpu resume failed");
-			pause_vcpu(vcpu, VCPU_ZOMBIE);
+			get_vm_lock(vcpu->vm);
+			zombie_vcpu(vcpu, VCPU_ZOMBIE);
+			put_vm_lock(vcpu->vm);
+			/* Fatal error happened (resume vcpu failed). Stop the vcpu running. */
 			continue;
 		}
 		basic_exit_reason = vcpu->arch.exit_reason & 0xFFFFU;
@@ -55,7 +62,9 @@ void vcpu_thread(struct sched_object *obj)
 
 		profiling_pre_vmexit_handler(vcpu);
 
-		CPU_IRQ_ENABLE();
+		if (!is_lapic_pt_enabled(vcpu)) {
+			CPU_IRQ_ENABLE();
+		}
 		/* Dispatch handler */
 		ret = vmexit_handler(vcpu);
 		if (ret < 0) {
@@ -69,19 +78,40 @@ void vcpu_thread(struct sched_object *obj)
 	} while (1);
 }
 
-void default_idle(__unused struct sched_object *obj)
+void default_idle(__unused struct thread_object *obj)
 {
-	uint16_t pcpu_id = get_cpu_id();
+	uint16_t pcpu_id = get_pcpu_id();
 
 	while (1) {
 		if (need_reschedule(pcpu_id)) {
 			schedule();
-		} else if (need_offline(pcpu_id) != 0) {
+		} else if (need_offline(pcpu_id)) {
 			cpu_dead();
+		} else if (need_shutdown_vm(pcpu_id)) {
+			shutdown_vm_from_idle(pcpu_id);
 		} else {
 			CPU_IRQ_ENABLE();
 			cpu_do_idle();
 			CPU_IRQ_DISABLE();
 		}
 	}
+}
+
+void run_idle_thread(void)
+{
+	uint16_t pcpu_id = get_pcpu_id();
+	struct thread_object *idle = &per_cpu(idle, pcpu_id);
+	char idle_name[16];
+
+	snprintf(idle_name, 16U, "idle%hu", pcpu_id);
+	(void)strncpy_s(idle->name, 16U, idle_name, 16U);
+	idle->pcpu_id = pcpu_id;
+	idle->thread_entry = default_idle;
+	idle->switch_out = NULL;
+	idle->switch_in = NULL;
+
+	run_thread(idle);
+
+	/* Control should not come here */
+	cpu_dead();
 }

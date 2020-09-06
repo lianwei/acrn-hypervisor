@@ -53,10 +53,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pty.h>
 #include <string.h>
 #include <stdbool.h>
 #include <types.h>
@@ -65,6 +63,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "pty_vuart.h"
+
+#include "dm.h"
 #include "ioc.h"
 #include "vmmapi.h"
 #include "monitor.h"
@@ -89,7 +90,7 @@ do { if (ioc_debug && dbg_file) { fprintf(dbg_file, format, arg);\
  * For debugging only, to generate lifecycle, signal and oem-raw data
  * from PTY devices instead of native CBC cdevs.
  */
-/* #define IOC_DUMMY */
+static bool ioc_debug_enable;
 
 /*
  * Type definition for thread function.
@@ -100,7 +101,7 @@ typedef void* (*ioc_work)(void *arg);
  * IOC mediator and virtual UART communication channel path,
  * comes from DM command line parameters.
  */
-static char virtual_uart_path[32];
+static char virtual_uart_path[32 + MAX_VMNAME_LEN];
 
 /*
  * To activate CBC signal channel(/dev/cbc-signals).
@@ -118,14 +119,12 @@ static uint8_t cbc_open_channel_command[] = {0xFD, 0x00, 0x00, 0x00};
 static uint32_t ioc_boot_reason;
 
 /*
- * Dummy pty slave fd is to maintain the pty active,
- * to avoid EIO error when close the slave pty.
+ * Dummy pty client fd is to maintain the pty active,
+ * to avoid EIO error when close the client pty.
  */
-#ifdef IOC_DUMMY
 static int dummy0_sfd = -1;
 static int dummy1_sfd = -1;
 static int dummy2_sfd = -1;
-#endif
 
 /*
  * VM Manager interfaces description.
@@ -236,12 +235,10 @@ static struct ioc_ch_info ioc_ch_tbl[] = {
 	{IOC_INIT_FD, IOC_NP_RAW10, IOC_NATIVE_RAW10,	IOC_CH_ON},
 	{IOC_INIT_FD, IOC_NP_RAW11, IOC_NATIVE_RAW11,	IOC_CH_ON},
 	{IOC_INIT_FD, IOC_DP_NONE,  IOC_VIRTUAL_UART,	IOC_CH_ON},
-	{IOC_INIT_FD, IOC_DP_NONE,  IOC_LOCAL_EVENT,	IOC_CH_ON}
-#ifdef IOC_DUMMY
+	{IOC_INIT_FD, IOC_DP_NONE,  IOC_LOCAL_EVENT,	IOC_CH_ON},
 	{IOC_INIT_FD, IOC_NP_FLF,   IOC_NATIVE_DUMMY0,	IOC_CH_ON},
 	{IOC_INIT_FD, IOC_NP_FSIG,  IOC_NATIVE_DUMMY1,	IOC_CH_ON},
 	{IOC_INIT_FD, IOC_NP_FRAW,  IOC_NATIVE_DUMMY2,	IOC_CH_ON}
-#endif
 };
 
 static struct cbc_signal cbc_tx_signal_table[] = {
@@ -714,83 +711,6 @@ ioc_open_native_ch(const char *dev_name)
 }
 
 /*
- * Check and create the directory.
- * To avoid symlink failure if the directory does not exist.
- */
-static int
-check_dir(const char *file)
-{
-	char *tmp, *dir;
-
-	tmp = strdup(file);
-	if (!tmp) {
-		DPRINTF("ioc falied to dup file, error:%s\r\n",
-				strerror(errno));
-		return -1;
-	}
-
-	dir = dirname(tmp);
-	if (access(dir, F_OK) && mkdir(dir, 0666)) {
-		DPRINTF("ioc falied to create dir:%s, erorr:%s\r\n", dir,
-				strerror(errno));
-		free(tmp);
-		return -1;
-	}
-	free(tmp);
-	return 0;
-}
-
-/*
- * Open PTY master device for IOC mediator and the PTY slave device for virtual
- * UART. The pair(master/slave) can work as a communication channel between
- * IOC mediator and virtual UART.
- */
-static int
-ioc_open_virtual_uart(const char *dev_name)
-{
-	int fd;
-	char *slave_name;
-	struct termios attr;
-
-	fd = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_NONBLOCK);
-	if (fd < 0)
-		goto open_err;
-	if (grantpt(fd) < 0)
-		goto pty_err;
-	if (unlockpt(fd) < 0)
-		goto pty_err;
-	slave_name = ptsname(fd);
-	if (!slave_name)
-		goto pty_err;
-	if ((unlink(dev_name) < 0) && errno != ENOENT)
-		goto pty_err;
-	/*
-	 * The check_dir restriction is that only create one directory
-	 * not support multi-level directroy.
-	 */
-	if (check_dir(dev_name) < 0)
-		goto pty_err;
-	if (symlink(slave_name, dev_name) < 0)
-		goto pty_err;
-	if (chmod(dev_name, 0660) < 0)
-		goto attr_err;
-	if (tcgetattr(fd, &attr) < 0)
-		goto attr_err;
-	cfmakeraw(&attr);
-	attr.c_cflag |= CLOCAL;
-	if (tcsetattr(fd, TCSANOW, &attr) < 0)
-		goto attr_err;
-	return fd;
-
-attr_err:
-	unlink(dev_name);
-pty_err:
-	close(fd);
-open_err:
-	return -1;
-}
-
-/*
  * Open native CBC cdevs and virtual UART.
  */
 static int
@@ -811,7 +731,7 @@ ioc_ch_init(struct ioc_dev *ioc)
 			fd = ioc_open_native_ch(chl->name);
 			break;
 		case IOC_VIRTUAL_UART:
-			fd = ioc_open_virtual_uart(virtual_uart_path);
+			fd = pty_open_virtual_uart(virtual_uart_path);
 			break;
 		case IOC_LOCAL_EVENT:
 			if (!pipe(pipe_fds)) {
@@ -822,24 +742,33 @@ ioc_ch_init(struct ioc_dev *ioc)
 				DPRINTF("%s", "ioc open event fd failed\r\n");
 			}
 			break;
-#ifdef IOC_DUMMY
 		/*
 		 * TODO: check open if success for dummy fd
 		 */
 		case IOC_NATIVE_DUMMY0:
-			fd = ioc_open_virtual_uart(chl->name);
-			dummy0_sfd = open(chl->name, O_RDWR | O_NOCTTY |
-					O_NONBLOCK);
-		case IOC_NATIVE_DUMMY1:
-			fd = ioc_open_virtual_uart(chl->name);
-			dummy1_sfd = open(chl->name, O_RDWR | O_NOCTTY |
-					O_NONBLOCK);
-		case IOC_NATIVE_DUMMY2:
-			fd = ioc_open_virtual_uart(chl->name);
-			dummy2_sfd = open(chl->name, O_RDWR | O_NOCTTY |
-					O_NONBLOCK);
+			if (ioc_debug_enable) {
+				fd = pty_open_virtual_uart(chl->name);
+				dummy0_sfd = open(chl->name, O_RDWR | O_NOCTTY |
+						O_NONBLOCK);
+			} else
+				fd = -1;
 			break;
-#endif
+		case IOC_NATIVE_DUMMY1:
+			if (ioc_debug_enable) {
+				fd = pty_open_virtual_uart(chl->name);
+				dummy1_sfd = open(chl->name, O_RDWR | O_NOCTTY |
+						O_NONBLOCK);
+			} else
+				fd = -1;
+			break;
+		case IOC_NATIVE_DUMMY2:
+			if (ioc_debug_enable) {
+				fd = pty_open_virtual_uart(chl->name);
+				dummy2_sfd = open(chl->name, O_RDWR | O_NOCTTY |
+						O_NONBLOCK);
+			} else
+				fd = -1;
+			break;
 		default:
 			fd = -1;
 			break;
@@ -880,11 +809,18 @@ ioc_ch_deinit(void)
 		chl->fd = IOC_INIT_FD;
 	}
 
-#ifdef IOC_DUMMY
-	close(dummy0_sfd);
-	close(dummy1_sfd);
-	close(dummy2_sfd);
-#endif
+	if (dummy0_sfd > 0) {
+		close(dummy0_sfd);
+		dummy0_sfd = -1;
+	}
+	if (dummy1_sfd > 0) {
+		close(dummy1_sfd);
+		dummy1_sfd = -1;
+	}
+	if (dummy2_sfd > 0) {
+		close(dummy2_sfd);
+		dummy2_sfd = -1;
+	}
 }
 
 /*
@@ -1221,7 +1157,6 @@ ioc_process_tx(struct ioc_dev *ioc, enum ioc_ch_id id)
 	req->srv_len = count;
 	req->link_len = 0;
 	req->rtype = CBC_REQ_T_PROT;
-#ifdef IOC_DUMMY
 	if (id == IOC_NATIVE_DUMMY0)
 		req->id = IOC_NATIVE_LFCC;
 	else if (id == IOC_NATIVE_DUMMY1)
@@ -1230,9 +1165,7 @@ ioc_process_tx(struct ioc_dev *ioc, enum ioc_ch_id id)
 		req->id = IOC_NATIVE_RAW11;
 	else
 		req->id = id;
-#else
-	req->id = id;
-#endif
+
 	cbc_request_enqueue(ioc, req, CBC_QUEUE_T_TX, false);
 	return 0;
 }
@@ -1248,11 +1181,9 @@ ioc_dispatch(struct ioc_dev *ioc, struct ioc_ch_info *chl)
 	case IOC_NATIVE_LFCC:
 	case IOC_NATIVE_SIGNAL:
 	case IOC_NATIVE_RAW0 ... IOC_NATIVE_RAW11:
-#ifdef IOC_DUMMY
 	case IOC_NATIVE_DUMMY0:
 	case IOC_NATIVE_DUMMY1:
 	case IOC_NATIVE_DUMMY2:
-#endif
 		ioc_process_tx(ioc, chl->id);
 		break;
 	case IOC_VIRTUAL_UART:
@@ -1321,7 +1252,6 @@ ioc_rx_thread(void *arg)
 	struct ioc_dev *ioc = (struct ioc_dev *) arg;
 	struct cbc_request *req = NULL;
 	struct cbc_pkt packet;
-	int err;
 
 	memset(&packet, 0, sizeof(packet));
 	packet.cfg = &ioc->rx_config;
@@ -1330,8 +1260,7 @@ ioc_rx_thread(void *arg)
 	for (;;) {
 		pthread_mutex_lock(&ioc->rx_mtx);
 		while (SIMPLEQ_EMPTY(&ioc->rx_qhead)) {
-			err = pthread_cond_wait(&ioc->rx_cond, &ioc->rx_mtx);
-			assert(err == 0);
+			pthread_cond_wait(&ioc->rx_cond, &ioc->rx_mtx);
 			if (ioc->closing)
 				goto exit;
 		}
@@ -1374,7 +1303,6 @@ ioc_tx_thread(void *arg)
 	struct ioc_dev *ioc = (struct ioc_dev *) arg;
 	struct cbc_request *req = NULL;
 	struct cbc_pkt packet;
-	int err;
 
 	memset(&packet, 0, sizeof(packet));
 	packet.cfg = &ioc->tx_config;
@@ -1383,8 +1311,7 @@ ioc_tx_thread(void *arg)
 	for (;;) {
 		pthread_mutex_lock(&ioc->tx_mtx);
 		while (SIMPLEQ_EMPTY(&ioc->tx_qhead)) {
-			err =  pthread_cond_wait(&ioc->tx_cond, &ioc->tx_mtx);
-			assert(err == 0);
+			pthread_cond_wait(&ioc->tx_cond, &ioc->tx_mtx);
 			if (ioc->closing)
 				goto exit;
 		}
@@ -1575,6 +1502,13 @@ ioc_parse(const char *opts)
 		goto exit;
 
 	ioc_boot_reason = strtoul(str, 0, 0);
+
+	/*
+	 * According to the CBC protocol, the wakeup reason only occupies 0-23
+	 * bits, so 24-31 bits are used for customized functions, and bit 24 is
+	 * used to check whether to enable the ioc mediator debug function.
+	 */
+	ioc_debug_enable = ioc_boot_reason & CBC_WK_RSN_DGB ? true : false;
 
 	/* Mask invalid bits of wakeup reason for IOC mediator */
 	ioc_boot_reason &= CBC_WK_RSN_ALL;

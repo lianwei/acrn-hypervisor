@@ -27,6 +27,7 @@
  */
 #define LOG_MESSAGE_MAX_SIZE	(4U * LOG_ENTRY_SIZE)
 
+#define DBG_LEVEL_LAPICPT	5U
 #if defined(HV_DEBUG)
 
 extern uint16_t console_loglevel;

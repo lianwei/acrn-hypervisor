@@ -6,27 +6,38 @@
 
 #ifndef E820_H
 #define E820_H
+#include <types.h>
 
-struct e820_mem_params {
+/* E820 memory types */
+#define E820_TYPE_RAM		1U	/* EFI 1, 2, 3, 4, 5, 6, 7 */
+#define E820_TYPE_RESERVED	2U
+/* EFI 0, 11, 12, 13 (everything not used elsewhere) */
+#define E820_TYPE_ACPI_RECLAIM	3U	/* EFI 9 */
+#define E820_TYPE_ACPI_NVS	4U	/* EFI 10 */
+#define E820_TYPE_UNUSABLE	5U	/* EFI 8 */
+
+#define E820_MAX_ENTRIES	32U
+
+/** Defines a single entry in an E820 memory map. */
+struct e820_entry {
+   /** The base address of the memory range. */
+	uint64_t baseaddr;
+   /** The length of the memory range. */
+	uint64_t length;
+   /** The type of memory region. */
+	uint32_t type;
+} __packed;
+
+struct mem_range {
 	uint64_t mem_bottom;
 	uint64_t mem_top;
 	uint64_t total_mem_size;
-	uint64_t max_ram_blk_base; /* used for the start address of UOS */
-	uint64_t max_ram_blk_size;
 };
 
 /* HV read multiboot header to get e820 entries info and calc total RAM info */
 void init_e820(void);
 
-/* before boot sos_vm(service OS), call it to hide the HV RAM entry in e820 table from sos_vm */
-void rebuild_sos_vm_e820(void);
-
-/* get some RAM below 1MB in e820 entries, hide it from sos_vm, return its start address */
-uint64_t e820_alloc_low_memory(uint32_t size_arg);
-
-/* copy the original e820 entries info to param_e820 */
-uint32_t create_e820_table(struct e820_entry *param_e820);
-
+uint64_t e820_alloc_memory(uint32_t size_arg, uint64_t max_addr);
 /* get total number of the e820 entries */
 uint32_t get_e820_entries_count(void);
 
@@ -34,17 +45,6 @@ uint32_t get_e820_entries_count(void);
 const struct e820_entry *get_e820_entry(void);
 
 /* get the e820 total memory info */
-const struct e820_mem_params *get_e820_mem_info(void);
-
-#ifdef CONFIG_PARTITION_MODE
-/*
- * Default e820 mem map:
- *
- * Assumption is every VM launched by ACRN in partition mode uses 2G of RAM.
- * there is reserved memory of 64K for MPtable and PCI hole of 512MB
- */
-#define NUM_E820_ENTRIES        5U
-extern const struct e820_entry e820_default_entries[NUM_E820_ENTRIES];
-#endif
+const struct mem_range *get_mem_range_info(void);
 
 #endif

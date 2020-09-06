@@ -47,9 +47,18 @@
 #endif
 
 /* Generic VM flags from guest OS */
-#define SECURE_WORLD_ENABLED    (1UL << 0U)	/* Whether secure world is enabled */
-#define LAPIC_PASSTHROUGH	(1UL << 1U)  	/* Whether LAPIC is passed through */
-#define IO_COMPLETION_POLLING	(1UL << 2U)  	/* Whether need hypervisor poll IO completion */
+#define GUEST_FLAG_SECURE_WORLD_ENABLED		(1UL << 0U)	/* Whether secure world is enabled */
+#define GUEST_FLAG_LAPIC_PASSTHROUGH		(1UL << 1U)  	/* Whether LAPIC is passed through */
+#define GUEST_FLAG_IO_COMPLETION_POLLING	(1UL << 2U)  	/* Whether need hypervisor poll IO completion */
+#define GUEST_FLAG_HIDE_MTRR			(1UL << 3U)  	/* Whether hide MTRR from VM */
+#define GUEST_FLAG_RT				(1UL << 4U)     /* Whether the vm is RT-VM */
+
+/* TODO: We may need to get this addr from guest ACPI instead of hardcode here */
+#define VIRTUAL_PM1A_CNT_ADDR		0x404U
+#define	VIRTUAL_PM1A_SCI_EN		0x0001
+#define VIRTUAL_PM1A_SLP_TYP		0x1c00U
+#define VIRTUAL_PM1A_SLP_EN		0x2000U
+#define	VIRTUAL_PM1A_ALWAYS_ZERO	0xc003
 
 /**
  * @brief Hypercall
@@ -341,20 +350,29 @@ struct acrn_create_vm {
 	/** Reserved */
 	uint16_t reserved1;
 
-	/** the GUID of this VM */
-	uint8_t	 GUID[16];
+	/** the UUID of this VM */
+	uint8_t	 uuid[16];
 
 	/* VM flag bits from Guest OS, now used
-	 *  SECURE_WORLD_ENABLED          (1UL<<0)
+	 *  GUEST_FLAG_SECURE_WORLD_ENABLED          (1UL<<0)
 	 */
 	uint64_t vm_flag;
 
+	uint64_t req_buf;
+
+	/**
+	 *   The least significant set bit is the PCPU # the VCPU 0 maps to;
+	 *   second set least significant bit is the PCPU # the VCPU 1 maps to;
+	 *   and so on...
+	*/
+	uint64_t cpu_affinity;
+
 	/** Reserved for future use*/
-	uint8_t  reserved2[24];
+	uint8_t  reserved2[8];
 } __aligned(8);
 
 /**
- * @brief Info to create a VCPU
+ * @brief Info to create a VCPU (deprecated)
  *
  * the parameter for HC_CREATE_VCPU hypercall
  */

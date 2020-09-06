@@ -7,12 +7,12 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
-#include <assert.h>
 #include <sys/timerfd.h>
 
 #include "vmmapi.h"
 #include "mevent.h"
 #include "timer.h"
+#include "log.h"
 
 /* We can use timerfd and epoll mechanism to emulate kinds of timers like
  * PIT/RTC/WDT/PMTIMER/... in device model under Linux.
@@ -46,12 +46,14 @@ timer_handler(int fd __attribute__((unused)),
 
 	if (size < 0) {
 		if (errno != EAGAIN) {
-			perror("acrn_timer read timerfd error");
+			pr_err("acrn_timer read timerfd error");
 		}
 		return;
 	}
 
-	assert(size > 0 && nexp > 0);
+	/* check the validity of timer expiration. */
+	if ((size == 0) || (nexp == 0))
+		return;
 
 	if ((cb = timer->callback) != NULL) {
 		(*cb)(timer->callback_param, nexp);
@@ -72,18 +74,18 @@ acrn_timer_init(struct acrn_timer *timer, void (*cb)(void *, uint64_t),
 		timer->fd = timerfd_create(timer->clockid,
 					TFD_NONBLOCK | TFD_CLOEXEC);
 	} else {
-		perror("acrn_timer clockid is not supported.\n");
+		pr_err("acrn_timer clockid is not supported.\n");
 	}
 
 	if (timer->fd <= 0) {
-		perror("acrn_timer create failed.\n");
+		pr_err("acrn_timer create failed.\n");
 		return -1;
 	}
 
 	timer->mevp = mevent_add(timer->fd, EVF_READ, timer_handler, timer, NULL, NULL);
 	if (timer->mevp == NULL) {
 		close(timer->fd);
-		perror("acrn_timer mevent add failed.\n");
+		pr_err("acrn_timer mevent add failed.\n");
 		return -1;
 	}
 
@@ -114,6 +116,7 @@ int32_t
 acrn_timer_settime(struct acrn_timer *timer, const struct itimerspec *new_value)
 {
 	if (timer == NULL) {
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -125,6 +128,7 @@ acrn_timer_settime_abs(struct acrn_timer *timer,
 		const struct itimerspec *new_value)
 {
 	if (timer == NULL) {
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -135,6 +139,7 @@ int32_t
 acrn_timer_gettime(struct acrn_timer *timer, struct itimerspec *cur_value)
 {
 	if (timer == NULL) {
+		errno = EINVAL;
 		return -1;
 	}
 

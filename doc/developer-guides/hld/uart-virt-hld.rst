@@ -4,8 +4,8 @@ UART Virtualization
 ###################
 
 In ACRN, UART virtualization is implemented as a fully-emulated device.
-In the Service OS (SOS), UART virtualization is implemented in the
-hypervisor itself.  In the User OS (UOS), UART virtualization is
+In the Service VM, UART virtualization is implemented in the
+hypervisor itself.  In the User VM, UART virtualization is
 implemented in the Device Model (DM), and is the primary topic of this
 document.  We'll summarize differences between the hypervisor and DM
 implementations at the end of this document.
@@ -56,7 +56,7 @@ the LPC bus. In the current implementation, two channel LPC UARTs are I/O mapped
 the traditional COM port addresses of 0x3F8 and 0x2F8. These are defined in
 global variable ``uart_lres``.
 
-There are two options needed for configuring the UART in the ``arcn-dm``
+There are two options needed for configuring the UART in the ``acrn-dm``
 command line. First, the LPC is defined as a PCI device::
 
    -s 1:0,lpc
@@ -78,7 +78,7 @@ command line, for example::
    -l com1,/dev/pts/1
 
 
-When arcn-dm starts, ``pci_lpc_init`` is called as the callback of the
+When acrn-dm starts, ``pci_lpc_init`` is called as the callback of the
 ``vdev_init`` of the PCI device given on the acrn-dm command line.
 Later, ``lpc_init`` is called in ``pci_lpc_init``. ``lpc_init`` iterates
 on the available UART instances defined on the command line and
@@ -93,7 +93,7 @@ A similar virtual UART device is implemented in the hypervisor.
 Currently UART16550 is owned by the hypervisor itself and is used for
 debugging purposes.  (The UART properties are configured by parameters
 to the hypervisor command line.) The hypervisor emulates a UART device
-with 0x3F8 address to the SOS and acts as the SOS console. The general
+with 0x3F8 address to the Service VM and acts as the Service VM console. The general
 emulation is the same as used in the device model, with the following
 differences:
 
@@ -110,8 +110,8 @@ differences:
    -  Characters are read from the sbuf and put to rxFIFO,
       triggered by ``vuart_console_rx_chars``
 
-   -  A virtual interrupt is sent to the SOS that triggered the read,
-      and characters from rxFIFO are sent to the SOS by emulating a read
+   -  A virtual interrupt is sent to the Service VM that triggered the read,
+      and characters from rxFIFO are sent to the Service VM by emulating a read
       of register ``UART16550_RBR``
 
 -  TX flow:

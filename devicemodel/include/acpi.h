@@ -36,13 +36,11 @@
 #define	ACPI_DISABLE		0xa1
 
 #define	PM1A_EVT_ADDR		0x400
-#define	PM1A_CNT_ADDR		0x404
 
-#define	IO_PMTMR		0x408	/* 4-byte i/o port for the timer */
+#define	IO_PMTMR		0x0	/* PM Timer is disabled in ACPI */
 
 /* All dynamic table entry no. */
 #define NHLT_ENTRY_NO		8
-#define PSDS_ENTRY_NO		10
 
 void acpi_table_enable(int num);
 uint32_t get_acpi_base(void);
@@ -60,5 +58,8 @@ void	dsdt_unindent(int levels);
 void	sci_init(struct vmctx *ctx);
 void	pm_write_dsdt(struct vmctx *ctx, int ncpu);
 void	pm_backto_wakeup(struct vmctx *ctx);
+void	inject_power_button_event(struct vmctx *ctx);
+void	power_button_init(struct vmctx *ctx);
+void	power_button_deinit(struct vmctx *ctx);
 
 #endif /* _ACPI_H_ */

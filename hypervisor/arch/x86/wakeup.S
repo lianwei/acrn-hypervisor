@@ -2,8 +2,6 @@
  * Copyright (C) <2018> Intel Corporation
  * SPDX-License-Identifier: BSD-3-Clause
  */
-#include <vcpu.h>
-#include <spinlock.h>
 
 /* NOTE:
  *
@@ -27,7 +25,7 @@
    .extern    restore_msrs
    .extern    cpu_ctx
    .extern    load_gdtr_and_tr
-   .extern    do_acpi_s3
+   .extern    do_acpi_sx
 
    .global    asm_enter_s3
 asm_enter_s3:
@@ -96,7 +94,7 @@ asm_enter_s3:
 	/*48U=0x30=CPU_CONTEXT_OFFSET_RSI*/
 	movq 0x30 + cpu_ctx(%rip), %rsi  /* pm1a_cnt_val */
 
-	call do_acpi_s3
+	call do_acpi_sx
 
 /*
  * When system resume from S3, trampoline_start64 will

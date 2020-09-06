@@ -11,6 +11,8 @@
 #ifndef PGTABLE_H
 #define PGTABLE_H
 
+#include <page.h>
+
 #define PAGE_PRESENT		(1UL << 0U)
 #define PAGE_RW			(1UL << 1U)
 #define PAGE_USER		(1UL << 2U)
@@ -29,22 +31,86 @@
 #define PAGE_CACHE_UC_MINUS	PAGE_PCD
 #define PAGE_CACHE_UC		(PAGE_PCD | PAGE_PWT)
 
-#define EPT_RD			(1UL << 0U)
-#define EPT_WR			(1UL << 1U)
-#define EPT_EXE			(1UL << 2U)
-#define EPT_MT_SHIFT		3U
-#define EPT_UNCACHED		(0UL << EPT_MT_SHIFT)
-#define EPT_WC			(1UL << EPT_MT_SHIFT)
-#define EPT_WT			(4UL << EPT_MT_SHIFT)
-#define EPT_WP			(5UL << EPT_MT_SHIFT)
-#define EPT_WB			(6UL << EPT_MT_SHIFT)
-#define EPT_MT_MASK		(7UL << EPT_MT_SHIFT)
-/* VTD: Second-Level Paging Entries: Snoop Control */
-#define EPT_SNOOP_CTRL		(1UL << 11U)
-#define EPT_VE			(1UL << 63U)
+/**
+ * @defgroup ept_mem_access_right EPT Memory Access Right
+ *
+ * This is a group that includes EPT Memory Access Right Definitions.
+ *
+ * @{
+ */
 
+/**
+ * @brief EPT memory access right is read-only.
+ */
+#define EPT_RD			(1UL << 0U)
+
+/**
+ * @brief EPT memory access right is read/write.
+ */
+#define EPT_WR			(1UL << 1U)
+
+/**
+ * @brief EPT memory access right is executable.
+ */
+#define EPT_EXE			(1UL << 2U)
+
+/**
+ * @brief EPT memory access right is read/write and executable.
+ */
 #define EPT_RWX			(EPT_RD | EPT_WR | EPT_EXE)
 
+/**
+ * @}
+ */
+/* End of ept_mem_access_right */
+
+/**
+ * @defgroup ept_mem_type EPT Memory Type
+ *
+ * This is a group that includes EPT Memory Type Definitions.
+ *
+ * @{
+ */
+
+/**
+ * @brief EPT memory type is specified in bits 5:3 of the EPT paging-structure entry.
+ */
+#define EPT_MT_SHIFT		3U
+
+/**
+ * @brief EPT memory type is uncacheable.
+ */
+#define EPT_UNCACHED		(0UL << EPT_MT_SHIFT)
+
+/**
+ * @brief EPT memory type is write combining.
+ */
+#define EPT_WC			(1UL << EPT_MT_SHIFT)
+
+/**
+ * @brief EPT memory type is write through.
+ */
+#define EPT_WT			(4UL << EPT_MT_SHIFT)
+
+/**
+ * @brief EPT memory type is write protected.
+ */
+#define EPT_WP			(5UL << EPT_MT_SHIFT)
+
+/**
+ * @brief EPT memory type is write back.
+ */
+#define EPT_WB			(6UL << EPT_MT_SHIFT)
+
+/**
+ * @}
+ */
+/* End of ept_mem_type */
+
+#define EPT_MT_MASK		(7UL << EPT_MT_SHIFT)
+#define EPT_VE			(1UL << 63U)
+/* EPT leaf entry bits (bit 52 - bit 63) should be maksed  when calculate PFN */
+#define EPT_PFN_HIGH_MASK	0xFFF0000000000000UL
 
 #define PML4E_SHIFT		39U
 #define PTRS_PER_PML4E		512UL
@@ -84,6 +150,29 @@
  *
  * @return The translated host-virtual address
  */
+static inline void *hpa2hva_early(uint64_t x)
+{
+	return (void *)x;
+}
+/**
+ * @brief Translate host-virtual address to host-physical address
+ *
+ * @param[in] x The specified host-virtual address
+ *
+ * @return The translated host-physical address
+ */
+static inline uint64_t hva2hpa_early(void *x)
+{
+	return (uint64_t)x;
+}
+
+/**
+ * @brief Translate host-physical address to host-virtual address
+ *
+ * @param[in] x The specified host-physical address
+ *
+ * @return The translated host-virtual address
+ */
 static inline void *hpa2hva(uint64_t x)
 {
 	return (void *)x;
@@ -95,7 +184,7 @@ static inline void *hpa2hva(uint64_t x)
  *
  * @return The translated host-physical address
  */
-static inline uint64_t hva2hpa(void *x)
+static inline uint64_t hva2hpa(const void *x)
 {
 	return (uint64_t)x;
 }
@@ -166,9 +255,10 @@ static inline uint64_t get_pgentry(const uint64_t *pte)
 /*
  * pgentry may means pml4e/pdpte/pde/pte
  */
-static inline void set_pgentry(uint64_t *ptep, uint64_t pte)
+static inline void set_pgentry(uint64_t *ptep, uint64_t pte, const struct memory_ops *mem_ops)
 {
 	*ptep = pte;
+	mem_ops->clflush_pagewalk(ptep);
 }
 
 static inline uint64_t pde_large(uint64_t pde)
@@ -180,6 +270,12 @@ static inline uint64_t pdpte_large(uint64_t pdpte)
 {
 	return pdpte & PAGE_PSE;
 }
+
+/**
+ *@pre (pml4_page != NULL) && (pg_size != NULL)
+ */
+const uint64_t *lookup_address(uint64_t *pml4_page, uint64_t addr,
+		uint64_t *pg_size, const struct memory_ops *mem_ops);
 
 /**
  * @}

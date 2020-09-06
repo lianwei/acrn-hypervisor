@@ -13,6 +13,8 @@ These chapters describe the ACRN architecture, high-level design,
 background, and motivation for specific areas within the ACRN hypervisor
 system.
 
+.. rst-class:: rst-columns
+
 .. toctree::
    :maxdepth: 2
 
@@ -21,7 +23,6 @@ system.
    Device Model <hld-devicemodel>
    Emulated Devices <hld-emulated-devices>
    Virtio Devices <hld-virtio-devices>
-   VM Management <hld-vm-management>
    Power Management <hld-power-management>
    Tracing and Logging <hld-trace-log>
    Virtual Bootloader <hld-vsbl>

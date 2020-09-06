@@ -76,7 +76,6 @@
  */
 
 #include <sys/types.h>
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -101,24 +100,27 @@ usb_emu_finddev(char *name)
 	return NULL;
 }
 
-struct usb_data_xfer_block *
-usb_data_xfer_append(struct usb_data_xfer *xfer, void *buf, int blen,
-		     void *hci_data, int ccs)
+struct usb_block *
+usb_block_append(struct usb_xfer *xfer, void *buf, int blen, void *hcb,
+		int hcb_len)
 {
-	struct usb_data_xfer_block *xb;
+	struct usb_block *xb;
 
-	if (xfer->ndata >= USB_MAX_XFER_BLOCKS)
+	if (xfer->ndata >= xfer->max_blk_cnt)
+		return NULL;
+
+	if (hcb == NULL)
 		return NULL;
 
 	xb = &xfer->data[xfer->tail];
 	xb->buf = buf;
 	xb->blen = blen;
-	xb->hci_data = hci_data;
-	xb->ccs = ccs;
-	xb->processed = USB_XFER_BLK_FREE;
+	memcpy(xb->hcb, hcb, hcb_len);
+	xb->stat = USB_BLOCK_FREE;
 	xb->bdone = 0;
+	xb->type = USB_DATA_NONE;
 	xfer->ndata++;
-	xfer->tail = (xfer->tail + 1) % USB_MAX_XFER_BLOCKS;
+	xfer->tail = index_inc(xfer->tail, xfer->max_blk_cnt);
 	return xb;
 }
 
@@ -129,50 +131,6 @@ usb_native_is_bus_existed(uint8_t bus_num)
 
 	snprintf(buf, sizeof(buf), "%s/usb%d", NATIVE_USBSYS_DEVDIR, bus_num);
 	return access(buf, R_OK) ? 0 : 1;
-}
-
-int
-usb_native_is_ss_port(uint8_t bus_of_port)
-{
-	char buf[128];
-	char speed[8];
-	int rc, fd;
-	int usb2_speed_sz = sizeof(NATIVE_USB2_SPEED);
-	int usb3_speed_sz = sizeof(NATIVE_USB3_SPEED);
-
-	assert(usb_native_is_bus_existed(bus_of_port));
-	snprintf(buf, sizeof(buf), "%s/usb%d/speed", NATIVE_USBSYS_DEVDIR,
-			bus_of_port);
-	if (access(buf, R_OK)) {
-		UPRINTF(LWRN, "can't find speed file\r\n");
-		return 0;
-	}
-
-	fd = open(buf, O_RDONLY);
-	if (fd < 0) {
-		UPRINTF(LWRN, "fail to open maxchild file\r\n");
-		return 0;
-	}
-
-	rc = read(fd, &speed, sizeof(speed));
-	if (rc < 0) {
-		UPRINTF(LWRN, "fail to read speed file\r\n");
-		goto errout;
-	}
-
-	if (rc < usb2_speed_sz) {
-		UPRINTF(LWRN, "read invalid speed data\r\n");
-		goto errout;
-	}
-
-	if (strncmp(speed, NATIVE_USB3_SPEED, usb3_speed_sz))
-		goto errout;
-
-	close(fd);
-	return 1;
-errout:
-	close(fd);
-	return 0;
 }
 
 int
@@ -221,6 +179,20 @@ usb_native_is_port_existed(uint8_t bus_num, uint8_t port_num)
 	}
 	close(fd);
 	return 1;
+}
+
+int
+usb_native_is_device_existed(struct usb_devpath *path)
+{
+	char _path[128];
+	int ret = 0;
+
+	if (path) {
+		snprintf(_path, sizeof(_path), "%s/%s", NATIVE_USBSYS_DEVDIR,
+				usb_dev_path(path));
+		ret = (access(_path, F_OK) == 0);
+	}
+	return ret;
 }
 
 void usb_parse_log_level(char level)

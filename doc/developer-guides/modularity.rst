@@ -13,7 +13,7 @@ include:
 * **Understandability** A modular design is easier to understand due to
   encapsulation.
 * **Testability** Modules can be integrated and tested in the reverse order of
-  dependencies among them. White-box integration tests help improve the coverage
+  dependencies among them. Modular integration tests help improve the coverage
   of tests and identify corner cases that are hard to trigger when testing the
   hypervisor as a whole.
 * **Configurability** Modular design makes it easy to configure certain
@@ -88,20 +88,21 @@ The components are listed as follows.
   virtualization. The vCPU loop module in this component handles VM exit events
   by calling the proper handler in the other components. Hypercalls are
   implemented as a special type of VM exit event. This component is also able to
-  inject upcall interrupts to SOS.
+  inject upcall interrupts to the Service VM.
 * **Device Emulation** This component implements devices that are emulated in
   the hypervisor itself, such as the virtual programmable interrupt controllers
   including vPIC, vLAPIC and vIOAPIC.
-* **Passthru Management** This component manages devices that are passed-through
+* **Passthrough Management** This component manages devices that are passed-through
   to specific VMs.
 * **Extended Device Emulation** This component implements an I/O request
-  mechanism that allow the hypervisor to forward I/O accesses from UOSes to SOS
+  mechanism that allow the hypervisor to forward I/O accesses from a User
+  VM to the Service VM.
   for emulation.
 * **VM Management** This component manages the creation, deletion and other
   lifecycle operations of VMs.
 * **Hypervisor Initialization** This component invokes the initialization
   subroutines in the other components to bring up the hypervisor and start up
-  SOS in sharing mode or all the VMs in partitioning mode.
+  Service VM in sharing mode or all the VMs in partitioning mode.
 
 ACRN hypervisor adopts a layered design where higher layers can invoke the
 interfaces of lower layers but not vice versa. The only exception is the
@@ -126,7 +127,7 @@ functions of that layer as well as the layers below.
 References
 **********
 
-.. [IEC_61508-3] IEC 61508-3:2010, Functional safety of electrical/electronic/programmable electronic safety-related systems – Part 3: Software requirements
+.. [IEC_61508-3] IEC 61508-3:2010, Functional safety of electrical/electronic/programmable electronic safety-related systems - Part 3: Software requirements
 
 .. [ISO_26262-6] ISO 26262-6:2011, Road vehicles - Functional safety - Part 6: Product development at the software level
 

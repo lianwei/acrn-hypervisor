@@ -30,6 +30,8 @@
 
 #include <sys/uio.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -37,7 +39,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <pthread.h>
 #include <termios.h>
 #include <limits.h>
@@ -86,6 +87,7 @@ enum virtio_console_be_type {
 	VIRTIO_CONSOLE_BE_TTY,
 	VIRTIO_CONSOLE_BE_PTY,
 	VIRTIO_CONSOLE_BE_FILE,
+	VIRTIO_CONSOLE_BE_SOCKET,
 	VIRTIO_CONSOLE_BE_MAX,
 	VIRTIO_CONSOLE_BE_INVALID = VIRTIO_CONSOLE_BE_MAX
 };
@@ -107,10 +109,14 @@ struct virtio_console_port {
 struct virtio_console_backend {
 	struct virtio_console_port	*port;
 	struct mevent			*evp;
+	struct mevent			*conn_evp;
 	int				fd;
+	int				server_fd;
 	bool				open;
 	enum virtio_console_be_type	be_type;
 	int				pts_fd;	/* only valid for PTY */
+	const char 			*portpath;
+	const char 			*socket_type;
 };
 
 struct virtio_console {
@@ -172,7 +178,8 @@ static const char *virtio_console_be_table[VIRTIO_CONSOLE_BE_MAX] = {
 	[VIRTIO_CONSOLE_BE_STDIO]	= "stdio",
 	[VIRTIO_CONSOLE_BE_TTY]		= "tty",
 	[VIRTIO_CONSOLE_BE_PTY]		= "pty",
-	[VIRTIO_CONSOLE_BE_FILE]	= "file"
+	[VIRTIO_CONSOLE_BE_FILE]	= "file",
+	[VIRTIO_CONSOLE_BE_SOCKET]	= "socket"
 };
 
 static struct termios virtio_console_saved_tio;
@@ -266,14 +273,12 @@ virtio_console_add_port(struct virtio_console *console, const char *name,
 
 static void
 virtio_console_control_tx(struct virtio_console_port *port, void *arg,
-			  struct iovec *iov, int niov)
+			  struct iovec *iov, int niov __attribute__((unused)))
 {
 	struct virtio_console *console;
 	struct virtio_console_port *tmp;
 	struct virtio_console_control resp, *ctrl;
 	int i;
-
-	assert(niov == 1);
 
 	console = port->console;
 	ctrl = (struct virtio_console_control *)iov->iov_base;
@@ -357,8 +362,10 @@ virtio_console_control_send(struct virtio_console *console,
 		return;
 
 	n = vq_getchain(vq, &idx, &iov, 1, NULL);
-
-	assert(n == 1);
+	if (n < 1) {
+		WPRINTF(("vtcon: control_send vq_getchain error %d\n", n));
+		return;
+	}
 
 	memcpy(iov.iov_base, ctrl, sizeof(struct virtio_console_control));
 	if (payload != NULL && len > 0)
@@ -424,6 +431,19 @@ virtio_console_reset_backend(struct virtio_console_backend *be)
 }
 
 static void
+virtio_console_socket_clear(struct virtio_console_backend *be)
+{
+	if (be->conn_evp) {
+		mevent_delete(be->conn_evp);
+		be->conn_evp = NULL;
+	}
+	if (be->fd != -1) {
+		close(be->fd);
+		be->fd = -1;
+	}
+}
+
+static void
 virtio_console_backend_read(int fd __attribute__((unused)),
 			    enum ev_type t __attribute__((unused)),
 			    void *arg)
@@ -465,6 +485,11 @@ virtio_console_backend_read(int fd __attribute__((unused)),
 			if (len == -1 && errno == EAGAIN)
 				return;
 
+			/* when client uos reboot or shutdown,
+			 * be->fd will be closed, then the return
+			 * value of readv function will be 0 */
+			if (len == 0 || errno == ECONNRESET)
+				goto clear;
 			/* any other errors */
 			goto close;
 		}
@@ -473,11 +498,22 @@ virtio_console_backend_read(int fd __attribute__((unused)),
 	} while (vq_has_descs(vq));
 
 	vq_endchains(vq, 1);
+	return;
 
 close:
 	virtio_console_reset_backend(be);
 	WPRINTF(("vtcon: be read failed and close! len = %d, errno = %d\n",
 		len, errno));
+clear:
+	if (be->be_type == VIRTIO_CONSOLE_BE_SOCKET && (be->socket_type == NULL
+		|| !strcmp(be->socket_type,"server"))) {
+		virtio_console_socket_clear(be);
+	} else if (be->be_type == VIRTIO_CONSOLE_BE_SOCKET
+		&& !strcmp(be->socket_type,"client")) {
+		virtio_console_reset_backend(be);
+		WPRINTF(("vtcon: be read failed and close! len = %d, errno = %d\n",
+			len, errno));
+	}
 }
 
 static void
@@ -494,13 +530,31 @@ virtio_console_backend_write(struct virtio_console_port *port, void *arg,
 
 	ret = writev(be->fd, iov, niov);
 	if (ret <= 0) {
-		/* backend cannot receive more data. For example when pts is
+		/* Case 1:backend cannot receive more data. For example when pts is
 		 * not connected to any client, its tty buffer will become full.
 		 * In this case we just drop data from guest hvc console.
+		 *
+		 * Case 2: Backend connection not yet setup. For example, when
+		 * virtio-console is used as console port with socket backend, guest
+		 * kernel tries to hook it up with hvc console and sets it up. It
+		 * doesn't check if a client is connected and can result in ENOTCONN
+		 * with virtio-console backend being reset. This will prevent
+		 * client connection at a later point. To avoid this, ignore
+		 * ENOTCONN error.
+		 *
+		 * PS: For Kata, the runtime first launches VM and then proxy which
+		 * acts as a client connects to this socket.
 		 */
-		if (ret == -1 && errno == EAGAIN)
+		if (ret == -1 && (errno == EAGAIN || errno == ENOTCONN))
 			return;
 
+		if (ret == -1 && errno == EBADF) {
+			if (be->be_type == VIRTIO_CONSOLE_BE_SOCKET && (be->socket_type == NULL
+				|| !strcmp(be->socket_type,"server"))) {
+				virtio_console_socket_clear(be);
+				return;
+			}
+		}
 		virtio_console_reset_backend(be);
 		WPRINTF(("vtcon: be write failed! errno = %d\n", errno));
 	}
@@ -562,6 +616,11 @@ virtio_console_open_backend(const char *path,
 		if (fd < 0)
 			WPRINTF(("vtcon: open failed: %s\n", path));
 		break;
+	case VIRTIO_CONSOLE_BE_SOCKET:
+		fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (fd < 0)
+			WPRINTF(("vtcon: socket open failed \n"));
+		break;
 	default:
 		WPRINTF(("not supported backend %d!\n", be_type));
 	}
@@ -570,12 +629,72 @@ virtio_console_open_backend(const char *path,
 }
 
 static int
+make_socket_non_blocking(int fd)
+{
+	int flags, s;
+
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags == -1) {
+		WPRINTF(("fcntl get failed =%d\n", errno));
+		return -1;
+	}
+
+	flags |= O_NONBLOCK;
+	s = fcntl(fd, F_SETFL, flags);
+	if (s == -1) {
+		WPRINTF(("fcntl set failed =%d\n", errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+virtio_console_accept_new_connection(int fd __attribute__((unused)),
+					enum ev_type t __attribute__((unused)), void *arg)
+{
+
+	int accepted_fd;
+	uint32_t len;
+	struct sockaddr_un addr;
+	struct virtio_console_backend *be = arg;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, be->portpath, sizeof(addr.sun_path));
+	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+
+	len = sizeof(addr);
+	/* be->server_fd is kept for client uos reconnect again */
+	accepted_fd = accept(be->server_fd, (struct sockaddr *)&addr, &len);
+	if (accepted_fd == -1) {
+		WPRINTF(("accept error= %d, addr.sun_path=%s\n", errno, addr.sun_path));
+		return;
+	} else {
+		be->fd = accepted_fd;
+	}
+
+	be->conn_evp = mevent_add(be->fd, EVF_READ, virtio_console_backend_read, be,
+				NULL, NULL);
+	if (be->conn_evp == NULL) {
+		WPRINTF(("accepted fd mevent_add failed\n"));
+		return;
+	}
+
+	if (make_socket_non_blocking(be->fd) == -1) {
+		WPRINTF(("accepted fd non-blocking failed\n"));
+		return;
+	}
+}
+
+static int
 virtio_console_config_backend(struct virtio_console_backend *be)
 {
 	int fd, flags;
 	char *pts_name = NULL;
-	int slave_fd = -1;
+	int client_fd = -1;
 	struct termios tio, saved_tio;
+	struct sockaddr_un addr;
 
 	if (!be || be->fd == -1)
 		return -1;
@@ -590,17 +709,17 @@ virtio_console_config_backend(struct virtio_console_backend *be)
 			return -1;
 		}
 
-		slave_fd = open(pts_name, O_RDWR);
-		if (slave_fd == -1) {
-			WPRINTF(("vtcon: slave_fd open failed, errno = %d\n",
+		client_fd = open(pts_name, O_RDWR);
+		if (client_fd == -1) {
+			WPRINTF(("vtcon: client_fd open failed, errno = %d\n",
 				errno));
 			return -1;
 		}
 
-		tcgetattr(slave_fd, &tio);
+		tcgetattr(client_fd, &tio);
 		cfmakeraw(&tio);
-		tcsetattr(slave_fd, TCSAFLUSH, &tio);
-		be->pts_fd = slave_fd;
+		tcsetattr(client_fd, TCSAFLUSH, &tio);
+		be->pts_fd = client_fd;
 
 		WPRINTF(("***********************************************\n"));
 		WPRINTF(("virt-console backend redirected to %s\n", pts_name));
@@ -626,6 +745,48 @@ virtio_console_config_backend(struct virtio_console_backend *be)
 			atexit(virtio_console_restore_stdio);
 		}
 		break;
+	case VIRTIO_CONSOLE_BE_SOCKET:
+		if (be->portpath == NULL) {
+			WPRINTF(("vtcon: portpath is NULL\n"));
+			return -1;
+		}
+
+		memset(&addr, 0, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		strncpy(addr.sun_path, be->portpath, sizeof(addr.sun_path));
+		addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+
+		if (be->socket_type == NULL || !strcmp(be->socket_type,"server")) {
+			unlink(be->portpath);
+			if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+				WPRINTF(("Bind Error = %d\n", errno));
+				return -1;
+			}
+			if (listen(fd, 64) == -1) {
+				WPRINTF(("Listen Error= %d\n", errno));
+				return -1;
+			}
+			if (make_socket_non_blocking(fd) == -1) {
+				WPRINTF(("Backend config: fcntl Error\n"));
+				return -1;
+			}
+		} else if (!strcmp(be->socket_type,"client")) {
+			if (access(be->portpath,0)) {
+				WPRINTF(("%s not exist\n", be->portpath));
+				return -1;
+			}
+			if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+				WPRINTF(("vtcon: connect error[%d] \n", errno));
+			} else {
+				if (make_socket_non_blocking(fd) == -1) {
+					WPRINTF(("Backend config: fcntl Error\n"));
+				}
+			}
+		} else {
+			WPRINTF(("Socket type not exist\n"));
+			return -1;
+		}
+
 	default:
 		break; /* nothing to do */
 	}
@@ -633,14 +794,79 @@ virtio_console_config_backend(struct virtio_console_backend *be)
 	return 0;
 }
 
+static enum virtio_console_be_type
+virtio_console_get_be_type(const char *backend)
+{
+	int i;
+
+	for (i = 0; i < VIRTIO_CONSOLE_BE_MAX; i++)
+		if (strcasecmp(backend, virtio_console_be_table[i]) == 0)
+			return i;
+
+	return VIRTIO_CONSOLE_BE_INVALID;
+}
+
 static int
-virtio_console_add_backend(struct virtio_console *console,
-			   const char *name, const char *path,
-			   enum virtio_console_be_type be_type,
-			   bool is_console)
+virtio_console_add_backend(struct virtio_console *console, char *opt)
 {
 	struct virtio_console_backend *be;
 	int error = 0, fd = -1;
+	bool is_console = false;
+	char *backend = NULL;
+	char *portname = NULL;
+	char *portpath = NULL;
+	char *socket_type = NULL;
+	enum virtio_console_be_type be_type = VIRTIO_CONSOLE_BE_INVALID;
+
+	backend = strsep(&opt, ":");
+	if (backend == NULL) {
+		WPRINTF(("vtcon: no backend is specified!\n"));
+		error = -1;
+		goto parse_fail;
+	}
+
+	if (backend[0] == '@') {
+		is_console = true;
+		backend++;
+	} else
+		is_console = false;
+
+	be_type = virtio_console_get_be_type(backend);
+	if (be_type == VIRTIO_CONSOLE_BE_INVALID) {
+		WPRINTF(("vtcon: invalid backend %s!\n",
+			backend));
+		error = -1;
+		goto parse_fail;
+	}
+
+	if (opt != NULL) {
+		if (be_type == VIRTIO_CONSOLE_BE_SOCKET) {
+			portname = strsep(&opt, "=");
+			portpath = strsep(&opt, ":");
+			socket_type = opt;
+		} else {
+			portname = strsep(&opt, "=");
+			portpath = opt;
+		}
+		if (portname == NULL) {
+			WPRINTF(("vtcon: portname missing \n"));
+			error = -1;
+			goto parse_fail;
+		}
+		if (portpath == NULL
+			&& be_type != VIRTIO_CONSOLE_BE_STDIO
+			&& be_type != VIRTIO_CONSOLE_BE_PTY
+			&& be_type != VIRTIO_CONSOLE_BE_SOCKET) {
+			WPRINTF(("vtcon: portpath missing for %s\n",
+				portname));
+			error = -1;
+			goto parse_fail;
+		}
+	} else {
+		WPRINTF(("vtcon: please at least config portname\n"));
+		error = -1;
+		goto parse_fail;
+	}
 
 	be = calloc(1, sizeof(struct virtio_console_backend));
 	if (be == NULL) {
@@ -648,14 +874,17 @@ virtio_console_add_backend(struct virtio_console *console,
 		goto out;
 	}
 
-	fd = virtio_console_open_backend(path, be_type);
+	fd = virtio_console_open_backend(portpath, be_type);
 	if (fd < 0) {
 		error = -1;
 		goto out;
 	}
 
 	be->fd = fd;
+	be->server_fd = fd;
 	be->be_type = be_type;
+	be->portpath = portpath;
+	be->socket_type = socket_type;
 
 	if (virtio_console_config_backend(be) < 0) {
 		WPRINTF(("vtcon: virtio_console_config_backend failed\n"));
@@ -663,7 +892,7 @@ virtio_console_add_backend(struct virtio_console *console,
 		goto out;
 	}
 
-	be->port = virtio_console_add_port(console, name,
+	be->port = virtio_console_add_port(console, portname,
 		virtio_console_backend_write, be, is_console);
 	if (be->port == NULL) {
 		WPRINTF(("vtcon: virtio_console_add_port failed\n"));
@@ -672,7 +901,20 @@ virtio_console_add_backend(struct virtio_console *console,
 	}
 
 	if (virtio_console_backend_can_read(be_type)) {
-		if (isatty(fd)) {
+		if (be->be_type == VIRTIO_CONSOLE_BE_SOCKET && (be->socket_type == NULL
+			|| !strcmp(be->socket_type,"server"))) {
+			be->evp = mevent_add(fd, EVF_READ,
+					virtio_console_accept_new_connection, be,
+					virtio_console_teardown_backend, be);
+			if (be->evp == NULL) {
+				WPRINTF(("vtcon: mevent_add failed\n"));
+				error = -1;
+				goto out;
+			}
+			console->ref_count++;
+		}
+		else if (isatty(fd) || (be->be_type == VIRTIO_CONSOLE_BE_SOCKET
+			&& !strcmp(be->socket_type,"client"))) {
 			be->evp = mevent_add(fd, EVF_READ,
 					virtio_console_backend_read, be,
 					virtio_console_teardown_backend, be);
@@ -704,7 +946,23 @@ out:
 			close(fd);
 	}
 
+parse_fail:
 	return error;
+}
+
+static int
+virtio_console_add_backends(struct virtio_console *console, char *opts)
+{
+	char *opt;
+
+	/* virtio-console,[@]stdio|tty|pty|file:portname[=portpath]
+	 * [,[@]stdio|tty|pty|file:portname[=portpath][:socket_type]]
+	 */
+	while ((opt = strsep(&opts, ",")) != NULL) {
+		if (virtio_console_add_backend(console, opt))
+			return -1;
+	}
+	return 0;
 }
 
 static void
@@ -722,6 +980,15 @@ virtio_console_close_backend(struct virtio_console_backend *be)
 		break;
 	case VIRTIO_CONSOLE_BE_STDIO:
 		virtio_console_restore_stdio();
+		break;
+	case VIRTIO_CONSOLE_BE_SOCKET:
+		if (be->socket_type == NULL || !strcmp(be->socket_type,"server")) {
+			virtio_console_socket_clear(be);
+			if (be->server_fd > 0) {
+				close(be->server_fd);
+				be->server_fd = -1;
+			}
+		}
 		break;
 	default:
 		break;
@@ -809,30 +1076,12 @@ virtio_console_close_all(struct virtio_console *console)
 	return rc;
 }
 
-static enum virtio_console_be_type
-virtio_console_get_be_type(const char *backend)
-{
-	int i;
-
-	for (i = 0; i < VIRTIO_CONSOLE_BE_MAX; i++)
-		if (strcasecmp(backend, virtio_console_be_table[i]) == 0)
-			return i;
-
-	return VIRTIO_CONSOLE_BE_INVALID;
-}
-
 static int
 virtio_console_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 {
 	struct virtio_console *console;
-	char *backend = NULL;
-	char *portname = NULL;
-	char *portpath = NULL;
-	char *opt;
 	int i;
 	pthread_mutexattr_t attr;
-	enum virtio_console_be_type be_type;
-	bool is_console = false;
 	int rc;
 
 	if (!opts) {
@@ -887,6 +1136,7 @@ virtio_console_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 	pci_set_cfgdata16(dev, PCIR_DEVICE, VIRTIO_DEV_CONSOLE);
 	pci_set_cfgdata16(dev, PCIR_VENDOR, VIRTIO_VENDOR);
 	pci_set_cfgdata8(dev, PCIR_CLASS, PCIC_SIMPLECOMM);
+	pci_set_cfgdata8(dev, PCIR_SUBCLASS, PCIS_SIMPLECOMM_OTHER);
 	pci_set_cfgdata16(dev, PCIR_SUBDEV_0, VIRTIO_TYPE_CONSOLE);
 	pci_set_cfgdata16(dev, PCIR_SUBVEND_0, VIRTIO_VENDOR);
 
@@ -906,49 +1156,8 @@ virtio_console_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 	console->control_port.rxq = 3;
 	console->control_port.cb = virtio_console_control_tx;
 	console->control_port.enabled = true;
-
-	/* virtio-console,[@]stdio|tty|pty|file:portname[=portpath]
-	 * [,[@]stdio|tty|pty|file:portname[=portpath]]
-	 */
-	while ((opt = strsep(&opts, ",")) != NULL) {
-		backend = strsep(&opt, ":");
-
-		if (backend == NULL) {
-			WPRINTF(("vtcon: no backend is specified!\n"));
-			return -1;
-		}
-
-		if (backend[0] == '@') {
-			is_console = true;
-			backend++;
-		} else
-			is_console = false;
-
-		be_type = virtio_console_get_be_type(backend);
-		if (be_type == VIRTIO_CONSOLE_BE_INVALID) {
-			WPRINTF(("vtcon: invalid backend %s!\n",
-				backend));
-			return -1;
-		}
-
-		if (opt != NULL) {
-			portname = strsep(&opt, "=");
-			portpath = opt;
-			if (portpath == NULL
-				&& be_type != VIRTIO_CONSOLE_BE_STDIO
-				&& be_type != VIRTIO_CONSOLE_BE_PTY) {
-				WPRINTF(("vtcon: portpath missing for %s\n",
-					portname));
-				return -1;
-			}
-
-			if (virtio_console_add_backend(console, portname,
-				portpath, be_type, is_console) < 0) {
-				WPRINTF(("vtcon: add port failed %s\n",
-					portname));
-				return -1;
-			}
-		}
+	if (virtio_console_add_backends(console, opts) < 0) {
+		return -1;
 	}
 
 	return 0;

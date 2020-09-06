@@ -3,11 +3,14 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
-#include <hypervisor.h>
-#include <reloc.h>
+
+#include <types.h>
+#include <mmu.h>
+#include <per_cpu.h>
 #include <trampoline.h>
-#include <vm0_boot.h>
-#include <e820.h>
+#include <reloc.h>
+#include <vboot.h>
+#include <ld_sym.h>
 
 static uint64_t trampoline_start16_paddr;
 
@@ -107,16 +110,11 @@ uint64_t prepare_trampoline(void)
 	uint64_t size, dest_pa, i;
 
 	size = (uint64_t)(&ld_trampoline_end - &ld_trampoline_start);
-#ifndef CONFIG_EFI_STUB
-	dest_pa = e820_alloc_low_memory(CONFIG_LOW_RAM_SIZE);
-#else
-	dest_pa = (uint64_t)get_ap_trampoline_buf();
-#endif
+	dest_pa = get_ap_trampoline_buf();
 
-	pr_dbg("trampoline code: %llx size %x", dest_pa, size);
+	pr_dbg("trampoline code: %lx size %x", dest_pa, size);
 
 	/* Copy segment for AP initialization code below 1MB */
-	stac();
 	(void)memcpy_s(hpa2hva(dest_pa), (size_t)size, &ld_trampoline_load,
 			(size_t)size);
 	update_trampoline_code_refs(dest_pa);
@@ -124,7 +122,6 @@ uint64_t prepare_trampoline(void)
 	for (i = 0UL; i < size; i = i + CACHE_LINE_SIZE) {
 		clflush(hpa2hva(dest_pa + i));
 	}
-	clac();
 
 	trampoline_start16_paddr = dest_pa;
 

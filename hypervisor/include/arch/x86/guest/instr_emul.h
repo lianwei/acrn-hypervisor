@@ -30,6 +30,11 @@
 #ifndef INSTR_EMUL_H
 #define INSTR_EMUL_H
 
+#include <types.h>
+#include <cpu.h>
+#include <guest_memory.h>
+
+struct acrn_vcpu;
 struct instr_emul_vie_op {
 	uint8_t		op_type;	/* type of operation (e.g. MOV) */
 	uint16_t	op_flags;
@@ -81,20 +86,11 @@ struct instr_emul_vie {
 	uint64_t	dst_gpa;	/* saved dst operand gpa. Only for movs */
 };
 
-struct vm_guest_paging {
-	uint64_t	cr3;
-	uint8_t		cpl;
-	enum vm_cpu_mode cpu_mode;
-	enum vm_paging_mode paging_mode;
-};
-
 struct instr_emul_ctxt {
 	struct instr_emul_vie vie;
-	struct vm_guest_paging paging;
-	struct acrn_vcpu *vcpu;
 };
 
-int32_t emulate_instruction(const struct acrn_vcpu *vcpu);
+int32_t emulate_instruction(struct acrn_vcpu *vcpu);
 int32_t decode_instruction(struct acrn_vcpu *vcpu);
 
 #endif

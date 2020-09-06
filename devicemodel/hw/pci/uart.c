@@ -60,22 +60,18 @@ static void
 pci_uart_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	       int baridx, uint64_t offset, int size, uint64_t value)
 {
-	assert(baridx == 0);
-	assert(size == 1);
-
-	uart_write(dev->arg, offset, value);
+	if (baridx == 0 && size == 1)
+		uart_write(dev->arg, offset, value);
 }
 
 uint64_t
 pci_uart_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	      int baridx, uint64_t offset, int size)
 {
-	uint8_t val;
+	uint8_t val = 0xff;
 
-	assert(baridx == 0);
-	assert(size == 1);
-
-	val = uart_read(dev->arg, offset);
+	if (baridx == 0 && size == 1)
+		val = uart_read(dev->arg, offset);
 	return val;
 }
 
@@ -92,7 +88,7 @@ pci_uart_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 
 	dev->arg = uart_set_backend(pci_uart_intr_assert, pci_uart_intr_deassert, dev, opts);
 	if (dev->arg == NULL) {
-		fprintf(stderr, "Unable to initialize backend '%s' for "
+		pr_err("Unable to initialize backend '%s' for "
 		    "pci uart at %d:%d\n", opts, dev->slot, dev->func);
 		return -1;
 	}

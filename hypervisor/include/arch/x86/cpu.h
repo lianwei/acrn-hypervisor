@@ -37,6 +37,8 @@
 
 #ifndef CPU_H
 #define CPU_H
+#include <types.h>
+#include <acrn_common.h>
 
 /* Define CPU stack alignment */
 #define CPU_STACK_ALIGN         16UL
@@ -82,6 +84,22 @@
 #define CR4_SMEP                (1UL<<20U)
 #define CR4_SMAP                (1UL<<21U)
 #define CR4_PKE                 (1UL<<22U)	/* Protect-key-enable */
+#define CR4_CET                 (1UL<<23U)	/* Control-flow Enforcement Technology enable */
+
+/* XCR0_SSE */
+#define XCR0_SSE		(1UL<<1U)
+/* XCR0_AVX */
+#define XCR0_AVX		(1UL<<2U)
+/* XCR0_BNDREGS */
+#define XCR0_BNDREGS		(1UL<<3U)
+/* XCR0_BNDCSR */
+#define XCR0_BNDCSR		(1UL<<4U)
+/* According to SDM Vol1 13.3:
+ *   XCR0[63:10] and XCR0[8] are reserved. Executing the XSETBV instruction causes
+ *   a general-protection fault if ECX = 0 and any corresponding bit in EDX:EAX
+ *   is not 0.
+ */
+#define	XCR0_RESERVED_BITS	((~((1UL << 10U) - 1UL)) | (1UL << 8U))
 
 
 /*
@@ -111,6 +129,10 @@
 /*Bits in EFER special registers */
 #define EFER_LMA 0x00000400U    /* Long mode active (R) */
 
+#define RFLAGS_C (1U<<0U)
+#define RFLAGS_Z (1U<<6U)
+#define RFLAGS_AC (1U<<18U)
+
 /* CPU clock frequencies (FSB) */
 #define CPU_FSB_83KHZ           83200
 #define CPU_FSB_100KHZ          99840
@@ -124,12 +146,53 @@
 #define CPU_MHZ_TO_HZ           1000000
 #define CPU_MHZ_TO_KHZ          1000
 
-/* Boot CPU ID */
-#define BOOT_CPU_ID             0U
+
+/* Number of GPRs saved / restored for guest in VCPU structure */
+#define NUM_GPRS                            16U
+
+#define XSAVE_STATE_AREA_SIZE			4096U
+#define XSAVE_LEGACY_AREA_SIZE			512U
+#define XSAVE_HEADER_AREA_SIZE			64U
+#define XSAVE_EXTEND_AREA_SIZE			(XSAVE_STATE_AREA_SIZE - \
+						XSAVE_HEADER_AREA_SIZE - \
+						XSAVE_LEGACY_AREA_SIZE)
+#define XSAVE_COMPACTED_FORMAT			(1UL << 63U)
+
+#define XSAVE_FPU				(1UL << 0U)
+#define XSAVE_SSE				(1UL << 1U)
+
+#define	CPU_CONTEXT_OFFSET_RAX			0U
+#define	CPU_CONTEXT_OFFSET_RCX			8U
+#define	CPU_CONTEXT_OFFSET_RDX			16U
+#define	CPU_CONTEXT_OFFSET_RBX			24U
+#define	CPU_CONTEXT_OFFSET_RSP			32U
+#define	CPU_CONTEXT_OFFSET_RBP			40U
+#define	CPU_CONTEXT_OFFSET_RSI			48U
+#define	CPU_CONTEXT_OFFSET_RDI			56U
+#define	CPU_CONTEXT_OFFSET_R8			64U
+#define	CPU_CONTEXT_OFFSET_R9			72U
+#define	CPU_CONTEXT_OFFSET_R10			80U
+#define	CPU_CONTEXT_OFFSET_R11			88U
+#define	CPU_CONTEXT_OFFSET_R12			96U
+#define	CPU_CONTEXT_OFFSET_R13			104U
+#define	CPU_CONTEXT_OFFSET_R14			112U
+#define	CPU_CONTEXT_OFFSET_R15			120U
+#define	CPU_CONTEXT_OFFSET_CR0			128U
+#define	CPU_CONTEXT_OFFSET_CR2			136U
+#define	CPU_CONTEXT_OFFSET_CR4			144U
+#define	CPU_CONTEXT_OFFSET_RIP			152U
+#define	CPU_CONTEXT_OFFSET_RFLAGS		160U
+#define	CPU_CONTEXT_OFFSET_IA32_SPEC_CTRL	168U
+#define	CPU_CONTEXT_OFFSET_IA32_EFER		176U
+#define	CPU_CONTEXT_OFFSET_EXTCTX_START		184U
+#define	CPU_CONTEXT_OFFSET_CR3			184U
+#define	CPU_CONTEXT_OFFSET_IDTR			192U
+#define	CPU_CONTEXT_OFFSET_LDTR			216U
 
 #ifndef ASSEMBLER
 
-#define	BUS_LOCK	"lock ; "
+#define ALL_CPUS_MASK		((1UL << get_pcpu_nums()) - 1UL)
+#define AP_MASK			(ALL_CPUS_MASK & ~(1UL << BSP_CPU_ID))
 
 /**
  *
@@ -193,8 +256,6 @@ enum cpu_reg_name {
 /**********************************/
 /* EXTERNAL VARIABLES             */
 /**********************************/
-extern uint8_t		ld_bss_start;
-extern uint8_t		ld_bss_end;
 
 /* In trampoline range, hold the jump target which trampline will jump to */
 extern uint64_t               main_entry[1];
@@ -217,6 +278,9 @@ extern uint64_t               secondary_cpu_stack[1];
  *   + offset_of_member_per_cpu_region
  * to locate the per cpu data.
  */
+
+/* Boot CPU ID */
+#define BSP_CPU_ID             0U
 
 /**
  *The invalid cpu_id (INVALID_CPU_ID) is error
@@ -246,16 +310,121 @@ enum pcpu_boot_state {
 	PCPU_STATE_DEAD,
 };
 
+#define	NEED_OFFLINE		(1U)
+#define	NEED_SHUTDOWN_VM	(2U)
+void make_pcpu_offline(uint16_t pcpu_id);
+bool need_offline(uint16_t pcpu_id);
+
+struct segment_sel {
+	uint16_t selector;
+	uint64_t base;
+	uint32_t limit;
+	uint32_t attr;
+};
+
+/**
+ * @brief registers info saved for vcpu running context
+ */
+struct run_context {
+/* Contains the guest register set.
+ * NOTE: This must be the first element in the structure, so that the offsets
+ * in vmx_asm.S match
+ */
+	union cpu_regs_t {
+		struct acrn_gp_regs regs;
+		uint64_t longs[NUM_GPRS];
+	} cpu_regs;
+
+	/** The guests CR registers 0, 2, 3 and 4. */
+	uint64_t cr0;
+
+	/* CPU_CONTEXT_OFFSET_CR2 =
+	 * offsetof(struct run_context, cr2) = 136
+	 */
+	uint64_t cr2;
+	uint64_t cr4;
+
+	uint64_t rip;
+	uint64_t rflags;
+
+	/* CPU_CONTEXT_OFFSET_IA32_SPEC_CTRL =
+	 * offsetof(struct run_context, ia32_spec_ctrl) = 168
+	 */
+	uint64_t ia32_spec_ctrl;
+	uint64_t ia32_efer;
+};
+
+union xsave_header {
+	uint64_t value[XSAVE_HEADER_AREA_SIZE / sizeof(uint64_t)];
+	struct {
+		/* bytes 7:0 */
+		uint64_t xstate_bv;
+		/* bytes 15:8 */
+		uint64_t xcomp_bv;
+	} hdr;
+};
+
+struct xsave_area {
+	uint64_t legacy_region[XSAVE_LEGACY_AREA_SIZE / sizeof(uint64_t)];
+	union xsave_header xsave_hdr;
+	uint64_t extend_region[XSAVE_EXTEND_AREA_SIZE / sizeof(uint64_t)];
+} __aligned(64);
+/*
+ * extended context does not save/restore during vm exit/entry, it's mainly
+ * used in trusty world switch
+ */
+struct ext_context {
+	uint64_t cr3;
+
+	/* segment registers */
+	struct segment_sel idtr;
+	struct segment_sel ldtr;
+	struct segment_sel gdtr;
+	struct segment_sel tr;
+	struct segment_sel cs;
+	struct segment_sel ss;
+	struct segment_sel ds;
+	struct segment_sel es;
+	struct segment_sel fs;
+	struct segment_sel gs;
+
+	uint64_t ia32_star;
+	uint64_t ia32_lstar;
+	uint64_t ia32_fmask;
+	uint64_t ia32_kernel_gs_base;
+
+	uint64_t ia32_pat;
+	uint32_t ia32_sysenter_cs;
+	uint64_t ia32_sysenter_esp;
+	uint64_t ia32_sysenter_eip;
+	uint64_t ia32_debugctl;
+
+	uint64_t dr7;
+	uint64_t tsc_offset;
+
+	struct xsave_area xs_area;
+	uint64_t xcr0;
+};
+
+struct cpu_context {
+	struct run_context run_ctx;
+	struct ext_context ext_ctx;
+};
+
 /* Function prototypes */
 void cpu_do_idle(void);
 void cpu_dead(void);
 void trampoline_start16(void);
-void load_cpu_state_data(void);
-void init_cpu_pre(uint16_t pcpu_id_args);
-void init_cpu_post(uint16_t pcpu_id);
-void start_cpus(void);
-void stop_cpus(void);
-void wait_sync_change(uint64_t *sync, uint64_t wake_sync);
+void load_pcpu_state_data(void);
+void init_pcpu_pre(bool is_bsp);
+/* The function should be called on the same CPU core as specified by pcpu_id,
+ * hereby, pcpu_id is actually the current physcial cpu id.
+ */
+void init_pcpu_post(uint16_t pcpu_id);
+bool start_pcpus(uint64_t mask);
+void wait_pcpus_offline(uint64_t mask);
+void stop_pcpus(void);
+void wait_sync_change(volatile const uint64_t *sync, uint64_t wake_sync);
 
 #define CPU_SEG_READ(seg, result_ptr)						\
 {										\
@@ -316,25 +485,17 @@ static inline void asm_hlt(void)
 	asm volatile ("hlt");
 }
 
-#ifdef CONFIG_PARTITION_MODE
-#define CPU_IRQ_DISABLE()
-#else
 /* Disables interrupts on the current CPU */
 #define CPU_IRQ_DISABLE()                                   \
 {                                                           \
 	asm volatile ("cli\n" : : : "cc");                  \
 }
-#endif
 
-#ifdef CONFIG_PARTITION_MODE
-#define CPU_IRQ_ENABLE()
-#else
 /* Enables interrupts on the current CPU */
 #define CPU_IRQ_ENABLE()                                    \
 {                                                           \
 	asm volatile ("sti\n" : : : "cc");                  \
 }
-#endif
 
 /* This macro writes the stack pointer. */
 static inline void cpu_sp_write(uint64_t *stack_ptr)
@@ -342,6 +503,12 @@ static inline void cpu_sp_write(uint64_t *stack_ptr)
 	uint64_t rsp = (uint64_t)stack_ptr & ~(CPU_STACK_ALIGN - 1UL);
 
 	asm volatile ("movq %0, %%rsp" : : "r"(rsp));
+}
+
+/* Synchronizes all write accesses to memory */
+static inline void cpu_write_memory_barrier(void)
+{
+	asm volatile ("sfence\n" : : : "memory");
 }
 
 /* Synchronizes all read and write accesses to/from memory */
@@ -413,7 +580,7 @@ cpu_rdtscp_execute(uint64_t *timestamp_ptr, uint32_t *cpu_id_ptr)
  * Macro to get CPU ID
  * @pre: the return CPU ID would never equal or large than phys_cpu_num.
  */
-static inline uint16_t get_cpu_id(void)
+static inline uint16_t get_pcpu_id(void)
 {
 	uint32_t tsl, tsh, cpu_id;
 
@@ -447,11 +614,63 @@ static inline void msr_write(uint32_t reg_num, uint64_t value64)
 	cpu_msr_write(reg_num, value64);
 }
 
+
+/* wrmsr/rdmsr smp call data */
+struct msr_data_struct {
+	uint32_t msr_index;
+	uint64_t read_val;
+	uint64_t write_val;
+};
+
+void msr_write_pcpu(uint32_t msr_index, uint64_t value64, uint16_t pcpu_id);
+uint64_t msr_read_pcpu(uint32_t msr_index, uint16_t pcpu_id);
+
 static inline void write_xcr(int32_t reg, uint64_t val)
 {
 	asm volatile("xsetbv" : : "c" (reg), "a" ((uint32_t)val), "d" ((uint32_t)(val >> 32U)));
 }
 
+static inline uint64_t read_xcr(int32_t reg)
+{
+	uint32_t  xcrl, xcrh;
+
+	asm volatile ("xgetbv ": "=a"(xcrl), "=d"(xcrh) : "c" (reg));
+	return (((uint64_t)xcrh << 32U) | xcrl);
+}
+
+static inline void xsaves(struct xsave_area *region_addr, uint64_t mask)
+{
+	asm volatile("xsaves %0"
+			: : "m" (*(region_addr)),
+			"d" ((uint32_t)(mask >> 32U)),
+			"a" ((uint32_t)mask):
+			"memory");
+}
+
+static inline void xrstors(const struct xsave_area *region_addr, uint64_t mask)
+{
+	asm volatile("xrstors %0"
+			: : "m" (*(region_addr)),
+			"d" ((uint32_t)(mask >> 32U)),
+			"a" ((uint32_t)mask):
+			"memory");
+}
+
+/*
+ * stac/clac pair is used to access guest's memory protected by SMAP,
+ * following below flow:
+ *
+ *	stac();
+ *	#access guest's memory.
+ *	clac();
+ *
+ * Notes:Avoid inserting another stac/clac pair between stac and clac,
+ *	As once clac after multiple stac will invalidate SMAP protection
+ *	and hence Page Fault crash.
+ *	Logging message to memory buffer will induce this case,
+ *	please disable SMAP temporlly or don't log messages to shared
+ *	memory buffer, if it is evitable for you for debug purpose.
+ */
 static inline void stac(void)
 {
 	asm volatile ("stac" : : : "memory");
@@ -462,6 +681,9 @@ static inline void clac(void)
 	asm volatile ("clac" : : : "memory");
 }
 
+/*
+ * @post return <= MAX_PCPU_NUM
+ */
 uint16_t get_pcpu_nums(void);
 bool is_pcpu_active(uint16_t pcpu_id);
 uint64_t get_active_pcpu_bitmap(void);

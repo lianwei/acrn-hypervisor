@@ -28,7 +28,6 @@
 #include <sys/cdefs.h>
 #include <sys/types.h>
 #include <stdio.h>
-#include <assert.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -41,6 +40,8 @@
 #include "mevent.h"
 #include "irq.h"
 #include "lpc.h"
+#include "monitor.h"
+#include "log.h"
 
 static pthread_mutex_t pm_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct mevent *power_button;
@@ -56,7 +57,6 @@ static int
 reset_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 	      uint32_t *eax, void *arg)
 {
-	int error;
 	static uint8_t reset_control;
 
 	if (bytes != 1)
@@ -67,15 +67,13 @@ reset_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 		reset_control = *eax;
 
 		if (*eax & 0x8) {
-			fprintf(stderr, "full reset\r\n");
-			error = vm_suspend(ctx, VM_SUSPEND_FULL_RESET);
-			assert(error ==0 || errno == EALREADY);
+			pr_notice("full reset\r\n");
+			vm_suspend(ctx, VM_SUSPEND_FULL_RESET);
 			mevent_notify();
 			reset_control = 0;
 		} else if (*eax & 0x4) {
-			fprintf(stderr, "system reset\r\n");
-			error = vm_suspend(ctx, VM_SUSPEND_SYSTEM_RESET);
-			assert(error ==0 || errno == EALREADY);
+			pr_notice("system reset\r\n");
+			vm_suspend(ctx, VM_SUSPEND_SYSTEM_RESET);
 			mevent_notify();
 		}
 	}
@@ -128,10 +126,25 @@ static uint16_t pm1_enable, pm1_status;
 #define	PM1_SLPBTN_EN		0x0200
 #define	PM1_RTC_EN		0x0400
 
+/*
+ * Power Management 1 Control Register
+ *
+ * This is mostly unimplemented except that we wish to handle writes that
+ * set SPL_EN to handle S5 (soft power off).
+ */
+static uint16_t pm1_control;
+
 static void
 sci_update(struct vmctx *ctx)
 {
 	int need_sci;
+
+	/*
+	 * Followed ACPI spec, should trigger SMI if SCI_EN is zero.
+	 * Return directly due to ACRN do not support SMI so far.
+	 */
+	if (!(pm1_control & VIRTUAL_PM1A_SCI_EN))
+		return;
 
 	/* See if the SCI should be active or not. */
 	need_sci = 0;
@@ -210,12 +223,10 @@ pm1_enable_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 INOUT_PORT(pm1_status, PM1A_EVT_ADDR, IOPORT_F_INOUT, pm1_status_handler);
 INOUT_PORT(pm1_enable, PM1A_EVT_ADDR + 2, IOPORT_F_INOUT, pm1_enable_handler);
 
-static void
-power_button_handler(int signal, enum ev_type type, void *arg)
+void
+inject_power_button_event(struct vmctx *ctx)
 {
-	struct vmctx *ctx;
-
-	ctx = arg;
+	pr_info("press power button\n");
 	pthread_mutex_lock(&pm_lock);
 	if (!(pm1_status & PM1_PWRBTN_STS)) {
 		pm1_status |= PM1_PWRBTN_STS;
@@ -224,25 +235,17 @@ power_button_handler(int signal, enum ev_type type, void *arg)
 	pthread_mutex_unlock(&pm_lock);
 }
 
-/*
- * Power Management 1 Control Register
- *
- * This is mostly unimplemented except that we wish to handle writes that
- * set SPL_EN to handle S5 (soft power off).
- */
-static uint16_t pm1_control;
-
-#define	PM1_SCI_EN	0x0001
-#define	PM1_SLP_TYP	0x1c00
-#define	PM1_SLP_EN	0x2000
-#define	PM1_ALWAYS_ZERO	0xc003
+static void
+power_button_handler(int signal, enum ev_type type, void *arg)
+{
+	if (arg)
+		inject_power_button_event(arg);
+}
 
 static int
 pm1_control_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 		    uint32_t *eax, void *arg)
 {
-	int error;
-
 	if (bytes != 2)
 		return -1;
 	if (in)
@@ -253,28 +256,26 @@ pm1_control_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 		 * to zero in pm1_control.  Always preserve SCI_EN as OSPM
 		 * can never change it.
 		 */
-		pm1_control = (pm1_control & PM1_SCI_EN) |
-		    (*eax & ~(PM1_SLP_EN | PM1_ALWAYS_ZERO));
+		pm1_control = (pm1_control & VIRTUAL_PM1A_SCI_EN) |
+		    (*eax & ~(VIRTUAL_PM1A_SLP_EN | VIRTUAL_PM1A_ALWAYS_ZERO));
 
 		/*
 		 * If SLP_EN is set, check for S5.  ACRN-DM's _S5_ method
 		 * says that '5' should be stored in SLP_TYP for S5.
 		 */
-		if (*eax & PM1_SLP_EN) {
-			if ((pm1_control & PM1_SLP_TYP) >> 10 == 5) {
-				error = vm_suspend(ctx, VM_SUSPEND_POWEROFF);
-				assert(error == 0 || errno == EALREADY);
+		if (*eax & VIRTUAL_PM1A_SLP_EN) {
+			if ((pm1_control & VIRTUAL_PM1A_SLP_TYP) >> 10 == 5) {
+				vm_suspend(ctx, VM_SUSPEND_POWEROFF);
 			}
 
-			if ((pm1_control & PM1_SLP_TYP) >> 10 == 3) {
-				error = vm_suspend(ctx, VM_SUSPEND_SUSPEND);
-				assert(error == 0 || errno == EALREADY);
+			if ((pm1_control & VIRTUAL_PM1A_SLP_TYP) >> 10 == 3) {
+				vm_suspend(ctx, VM_SUSPEND_SUSPEND);
 			}
 		}
 	}
 	return 0;
 }
-INOUT_PORT(pm1_control, PM1A_CNT_ADDR, IOPORT_F_INOUT, pm1_control_handler);
+INOUT_PORT(pm1_control, VIRTUAL_PM1A_CNT_ADDR, IOPORT_F_INOUT, pm1_control_handler);
 SYSRES_IO(PM1A_EVT_ADDR, 8);
 
 /*
@@ -286,22 +287,33 @@ static int
 smi_cmd_handler(struct vmctx *ctx, int vcpu, int in, int port, int bytes,
 		uint32_t *eax, void *arg)
 {
-	assert(!in);
-	if (bytes != 1)
+	if (in || (bytes != 1))
 		return -1;
 
 	pthread_mutex_lock(&pm_lock);
-	switch (*eax) {
+	switch (*eax & 0xFF) {
 	case ACPI_ENABLE:
-		pm1_control |= PM1_SCI_EN;
+		pm1_control |= VIRTUAL_PM1A_SCI_EN;
+		/*
+		 * FIXME: ACPI_ENABLE/ACPI_DISABLE only impacts SCI_EN via SMI
+		 * command register, not impact power button emulation. so need
+		 * to remove all power button emulation from here.
+		 */
 		if (power_button == NULL) {
+
+			/*
+			 * TODO: For the SIGTERM, IOC mediator also needs to
+			 * support it, and SIGTERM handler needs to be written
+			 * as one common interface for both APCI power button
+			 * and IOC mediator in future.
+			 */
 			power_button = mevent_add(SIGTERM, EVF_SIGNAL,
 				power_button_handler, ctx, NULL, NULL);
 			old_power_handler = signal(SIGTERM, SIG_IGN);
 		}
 		break;
 	case ACPI_DISABLE:
-		pm1_control &= ~PM1_SCI_EN;
+		pm1_control &= ~VIRTUAL_PM1A_SCI_EN;
 		if (power_button != NULL) {
 			mevent_delete(power_button);
 			power_button = NULL;

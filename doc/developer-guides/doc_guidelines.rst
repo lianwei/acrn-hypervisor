@@ -16,10 +16,10 @@ web browser. This same ``.rst`` content is also fed into the
 You can read details about `reStructuredText`_
 and about `Sphinx extensions`_ from their respective websites.
 
-.. _Sphinx extensions: http://www.sphinx-doc.org/en/stable/contents.html
+.. _Sphinx extensions: https://www.sphinx-doc.org/en/stable/contents.html
 .. _reStructuredText: http://docutils.sourceforge.net/docs/ref/rst/restructuredtext.html
-.. _Sphinx Inline Markup:  http://sphinx-doc.org/markup/inline.html#inline-markup
-.. _Project ACRN documentation:  http://projectacrn.github.io
+.. _Sphinx Inline Markup: https://www.sphinx-doc.org/en/master/usage/restructuredtext/roles.html
+.. _Project ACRN documentation:  https://projectacrn.github.io
 
 This document provides a quick reference for commonly used reST and
 Sphinx-defined directives and roles used to create the documentation
@@ -165,29 +165,13 @@ Would be rendered as:
 Multi-column lists
 ******************
 
-If you have a long bullet list of items, where each item is short,
-you can indicate the list items should be rendered in multiple columns
-with a special ``hlist`` directive:
+If you have a long bullet list of items, where each item is short, you
+can indicate the list items should be rendered in multiple columns with
+a special ``.. rst-class:: rst-columns`` directive.  The directive will
+apply to the next non-comment element (e.g., paragraph), or to content
+indented under the directive. For example, this unordered list::
 
-.. code-block:: rest
-
-   .. hlist::
-      :columns: 3
-
-      * A list of
-      * short items
-      * that should be
-      * displayed
-      * horizontally
-      * so it doesn't
-      * use up so much
-      * space on
-      * the page
-
-This would be rendered as:
-
-.. hlist::
-   :columns: 3
+   .. rst-class:: rst-columns
 
    * A list of
    * short items
@@ -199,8 +183,103 @@ This would be rendered as:
    * space on
    * the page
 
-Note the optional ``:columns:`` parameter (default is two columns), and
-all the list items are indented by three spaces.
+would be rendered as:
+
+.. rst-class:: rst-columns
+
+   * A list of
+   * short items
+   * that should be
+   * displayed
+   * horizontally
+   * so it doesn't
+   * use up so much
+   * space on
+   * the page
+
+A maximum of three columns will be displayed if you use ``rst-columns``
+or ``rst-columns3`` (and two columns for ``rst-columns2``), and change
+based on the available width of the display window, reducing to one
+column on narrow (phone) screens if necessary.  We've deprecated use of
+the ``hlist`` directive because it misbehaves on smaller screens.
+
+Tables
+******
+
+There are a few ways to create tables, each with their limitations or
+quirks.  `Grid tables
+<http://docutils.sourceforge.net/docs/ref/rst/restructuredtext.html#grid-tables>`_
+offer the most capability for defining merged rows and columns, but are
+hard to maintain::
+
+   +------------------------+------------+----------+----------+
+   | Header row, column 1   | Header 2   | Header 3 | Header 4 |
+   | (header rows optional) |            |          |          |
+   +========================+============+==========+==========+
+   | body row 1, column 1   | column 2   | column 3 | column 4 |
+   +------------------------+------------+----------+----------+
+   | body row 2             | ...        | ...      | you can  |
+   +------------------------+------------+----------+ easily   +
+   | body row 3 with a two column span   | ...      | span     |
+   +------------------------+------------+----------+ rows     +
+   | body row 4             | ...        | ...      | too      |
+   +------------------------+------------+----------+----------+
+
+This example would render as:
+
++------------------------+------------+----------+----------+
+| Header row, column 1   | Header 2   | Header 3 | Header 4 |
+| (header rows optional) |            |          |          |
++========================+============+==========+==========+
+| body row 1, column 1   | column 2   | column 3 | column 4 |
++------------------------+------------+----------+----------+
+| body row 2             | ...        | ...      | you can  |
++------------------------+------------+----------+ easily   +
+| body row 3 with a two column span   | ...      | span     |
++------------------------+------------+----------+ rows     +
+| body row 4             | ...        | ...      | too      |
++------------------------+------------+----------+----------+
+
+`List tables
+<http://docutils.sourceforge.net/docs/ref/rst/directives.html#list-table>`_
+are much easier to maintain, but don't support row or column spans::
+
+   .. list-table:: Table title
+      :widths: 15 20 40
+      :header-rows: 1
+
+      * - Heading 1
+        - Heading 2
+        - Heading 3
+      * - body row 1, column 1
+        - body row 1, column 2
+        - body row 1, column 3
+      * - body row 2, column 1
+        - body row 2, column 2
+        - body row 2, column 3
+
+This example would render as:
+
+.. list-table:: Table title
+   :widths: 15 20 40
+   :header-rows: 1
+
+   * - Heading 1
+     - Heading 2
+     - Heading 3
+   * - body row 1, column 1
+     - body row 1, column 2
+     - body row 1, column 3
+   * - body row 2, column 1
+     - body row 2, column 2
+     - body row 2, column 3
+
+The ``:widths:`` parameter lets you define relative column widths.  The
+default is equal column widths. If you have a three-column table and you
+want the first column to be half as wide as the other two equal-width
+columns, you can specify ``:widths: 1 2 2``.  If you'd like the browser
+to set the column widths automatically based on the column contents, you
+can use ``:widths: auto``.
 
 File names and Commands
 ***********************
@@ -222,7 +301,7 @@ Don't use items within a single backtick, for example ```word```.
 Internal Cross-Reference Linking
 ********************************
 
-ReST links are only supported within the current file using the
+Traditional ReST links are only supported within the current file using the
 notation:
 
 .. code-block:: rest
@@ -251,7 +330,7 @@ Note the leading underscore indicating an inbound link.
 The content immediately following
 this label is the target for a ``:ref:`my label name```
 reference from anywhere within the documentation set.
-The label should be added immediately before a heading so there's a
+The label **must** be added immediately before a heading so there's a
 natural phrase to show when referencing this label (e.g., the heading
 text).
 
@@ -328,7 +407,7 @@ For example:
 
 Note the blank line between the ``code-block`` directive and the first
 line of the code-block body, and the body content is indented three
-spaces (to the first non-white space of the directive name).
+spaces (to the first non-blank space of the directive name).
 
 This would be rendered as:
 
@@ -369,13 +448,37 @@ highlighting package makes a best guess at the type of content in the
 block and highlighting purposes.  This can lead to some odd
 highlighting in the generated output.
 
+Images
+******
+
+Images are included in documentation by using an image directive::
+
+   .. image:: ../../images/doc-gen-flow.png
+      :align: center
+      :alt: alt text for the image
+
+or if you'd like to add an image caption, use::
+
+    .. figure:: ../../images/doc-gen-flow.png
+       :alt: image description
+
+       Caption for the figure
+
+The file name specified is relative to the document source file,
+and we recommend putting images into an ``images`` folder where the document
+source is found.  The usual image formats handled by a web browser are
+supported: JPEG, PNG, GIF, and SVG.  Keep the image size only as large
+as needed, generally at least 500 px wide but no more than 1000 px, and
+no more than 250 KB unless a particularly large image is needed for
+clarity.
+
 Tabs, spaces, and indenting
 ***************************
 
 Indenting is significant in reST file content, and using spaces is
 preferred.  Extra indenting can (unintentionally) change the way content
 is rendered too.  For lists and directives, indent the content text to
-the first non-white space in the preceding line.  For example:
+the first non-blank space in the preceding line.  For example:
 
 .. code-block:: rest
 
@@ -431,4 +534,121 @@ We've also included the ``graphviz`` Sphinx extension to let you use a text
 description language to render drawings.  See :ref:`graphviz-examples` for more
 information.
 
+Alternative Tabbed Content
+**************************
 
+Instead of creating multiple documents with common material except for
+some specific sections, you can write one document and provide alternative
+content to the reader via a tabbed interface. When the reader clicks on
+a tab, the content for that tab is displayed, for example::
+
+   .. tabs::
+
+      .. tab:: Apples
+
+         Apples are green, or sometimes red.
+
+      .. tab:: Pears
+
+         Pears are green.
+
+      .. tab:: Oranges
+
+         Oranges are orange.
+
+will display as:
+
+.. tabs::
+
+   .. tab:: Apples
+
+      Apples are green, or sometimes red.
+
+   .. tab:: Pears
+
+      Pears are green.
+
+   .. tab:: Oranges
+
+      Oranges are orange.
+
+Tabs can also be grouped, so that changing the current tab in one area
+changes all tabs with the same name throughout the page.  For example:
+
+.. tabs::
+
+   .. group-tab:: Linux
+
+      Linux Line 1
+
+   .. group-tab:: macOS
+
+      macOS Line 1
+
+   .. group-tab:: Windows
+
+      Windows Line 1
+
+.. tabs::
+
+   .. group-tab:: Linux
+
+      Linux Line 2
+
+   .. group-tab:: macOS
+
+      macOS Line 2
+
+   .. group-tab:: Windows
+
+      Windows Line 2
+
+In this latter case, we're using a ``.. group-tab::`` directive instead of
+a ``.. tab::`` directive.  Under the hood, we're using the `sphinx-tabs
+<https://github.com/djungelorm/sphinx-tabs>`_ extension that's included
+in the ACRN (requirements.txt)  setup.  Within a tab, you can have most
+any content *other than a heading* (code-blocks, ordered and unordered
+lists, pictures, paragraphs, and such).  You can read more about
+sphinx-tabs from the link above.
+
+Instruction Steps
+*****************
+
+Numbered instruction steps is a style that makes it
+easy to create tutorial guides with clearly identified steps. Add
+the ``.. rst-class:: numbered-step`` directive immediately before a
+second-level heading (by project convention, a heading underlined with
+asterisks ``******``, and it will be displayed as a numbered step,
+sequentially numbered within the document.  (Second-level headings
+without this ``rst-class`` directive will not be numbered.) For example::
+
+   .. rst-class:: numbered-step
+
+   Put your right hand in
+   **********************
+
+.. rst-class:: numbered-step
+
+First instruction step
+**********************
+
+This is the first instruction step material.  You can do the usual paragraphs and
+pictures as you'd use in normal document writing. Write the heading to
+be a summary of what the step is (the step numbering is automated so you
+can move steps around easily if needed).
+
+.. rst-class:: numbered-step
+
+Second instruction step
+***********************
+
+This is the second instruction step.
+
+.. note:: As implemented,
+   only one set of numbered steps is intended per document and the steps
+   must be level 2 headings.
+
+Documentation Generation
+************************
+
+For instructions on building the documentation, see :ref:`acrn_doc`.

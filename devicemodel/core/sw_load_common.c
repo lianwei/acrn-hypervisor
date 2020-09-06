@@ -33,9 +33,10 @@
 #include "vmmapi.h"
 #include "sw_load.h"
 #include "dm.h"
+#include "pci_core.h"
 
 int with_bootargs;
-static char bootargs[STR_LEN];
+static char bootargs[BOOT_ARG_LEN];
 
 /*
  * Default e820 mem map:
@@ -49,65 +50,104 @@ static char bootargs[STR_LEN];
  *   map[0]:0~ctx->lowmem_limit & map[2]:4G~ctx->highmem for RAM
  *   ctx->highmem = request_memory_size - ctx->lowmem_limit
  *
- *             Begin      End         Type         Length
- * 0:             0 -     0xef000     RAM          0xEF000
- * 1	    0xef000 -	  0x100000    (reserved)   0x11000
- * 2       0x100000 -	  lowmem      RAM          lowmem - 0x100000
- * 3:        lowmem -     bff_fffff   (reserved)   0xc00_00000-lowmem
- * 4:   0xc00_00000 -     dff_fffff   PCI hole     512MB
- * 5:   0xe00_00000 -     fff_fffff   (reserved)   512MB
- * 6:   1_000_00000 -     highmem     RAM          highmem-4G
+ *             Begin    Limit       Type            Length
+ * 0:              0 -  0xA0000     RAM             0xA0000
+ * 1:        0xA0000 -  0x100000    (reserved)      0x60000
+ * 2:       0x100000 -  lowmem      RAM             lowmem - 1MB
+ * 3:         lowmem -  0x80000000  (reserved)      2GB - lowmem
+ * 4:	  0x80000000 -  0x88000000  (reserved)	    128MB
+ * 5:     0xDB000000 -  0xDF000000  (reserved)      64MB
+ * 6:     0xDF000000 -  0xE0000000  (reserved)      16MB
+ * 7:     0xE0000000 -  0x100000000 MCFG, MMIO      512MB
+ * 8:    0x100000000 -  0x140000000 64-bit PCI hole 1GB
+ * 9:    0x140000000 -  highmem     RAM             highmem - 5GB
  */
 const struct e820_entry e820_default_entries[NUM_E820_ENTRIES] = {
-	{	/* 0 to mptable/smbios/acpi */
-		.baseaddr =  0x00000000,
-		.length   =  0xEF000,
-		.type     =  E820_TYPE_RAM
+	{	/* 0 to video memory */
+		.baseaddr = 0x00000000,
+		.length   = 0xA0000,
+		.type     = E820_TYPE_RAM
 	},
 
-	{	/* guest_cfg_addr/mptable/smbios/acpi to lowmem */
-		.baseaddr = 0xEF000,
-		.length	  = 0x11000,
-		.type	  = E820_TYPE_RESERVED
+	{	/* video memory, ROM (used for e820/mptable/smbios/acpi) */
+		.baseaddr = 0xA0000,
+		.length   = 0x60000,
+		.type     = E820_TYPE_RESERVED
 	},
 
-	{	/* lowmem to lowmem_limit*/
-		.baseaddr =  0x100000,
-		.length   =  0x48f00000,
-		.type     =  E820_TYPE_RAM
+	{	/* 1MB to lowmem */
+		.baseaddr = 0x100000,
+		.length   = 0x48f00000,
+		.type     = E820_TYPE_RAM
 	},
 
-	{	/* lowmem to lowmem_limit*/
-		.baseaddr =  0x49000000,
-		.length   =  0x77000000,
-		.type     =  E820_TYPE_RESERVED
-	},
-
-	{	/* lowmem_limit to 4G */
-		.baseaddr =  0xe0000000,
-		.length   =  0x20000000,
-		.type     =  E820_TYPE_RESERVED
+	{	/* lowmem to lowmem_limit */
+		.baseaddr = 0x49000000,
+		.length   = 0x37000000,
+		.type     = E820_TYPE_RESERVED
 	},
 
 	{
-		.baseaddr =  0x100000000,
-		.length   =  0x000100000,
-		.type     =  E820_TYPE_RESERVED
+		/* reserve for PRM resource */
+		.baseaddr = 0x80000000,
+		.length	  = 0x8000000,
+		.type     = E820_TYPE_RESERVED
+	},
+
+	{
+		/* reserve for GVT-d graphics stolen memory.
+		 * The native BIOS allocates the stolen memory by itself,
+		 * and size can be configured by user itself through BIOS GUI.
+		 * For ACRN, we simply hard code to 64MB and static
+		 * reserved the memory region to avoid more efforts in OVMF,
+		 * and user *must* align the native BIOS setting to 64MB.
+		 *
+		 * GPU_GSM_GPA micro in passthrough.c should
++		 * align with this address here.
+		 */
+		.baseaddr = 0xDB000000,
+		.length	  = 0x4000000,
+		.type     = E820_TYPE_RESERVED
+	},
+
+	{
+		/* reserve for GVT */
+		.baseaddr = 0xDF000000,
+		.length	  = 0x1000000,
+		.type     = E820_TYPE_RESERVED
+	},
+
+	{	/* ECFG_BASE to 4GB */
+		.baseaddr = PCI_EMUL_ECFG_BASE,
+		.length   = (4 * GB) - PCI_EMUL_ECFG_BASE,
+		.type     = E820_TYPE_RESERVED
+	},
+
+	{	/* 4GB to 5GB */
+		.baseaddr = PCI_EMUL_MEMBASE64,
+		.length   = PCI_EMUL_MEMLIMIT64 - PCI_EMUL_MEMBASE64,
+		.type     = E820_TYPE_RESERVED
+	},
+
+	{	/* 5GB to highmem */
+		.baseaddr = PCI_EMUL_MEMLIMIT64,
+		.length   = 0x000100000,
+		.type     = E820_TYPE_RESERVED
 	},
 };
 
 int
 acrn_parse_bootargs(char *arg)
 {
-	size_t len = strnlen(arg, STR_LEN);
+	size_t len = strnlen(arg, BOOT_ARG_LEN);
 
-	if (len < STR_LEN) {
+	if (len < BOOT_ARG_LEN) {
 		strncpy(bootargs, arg, len + 1);
 		with_bootargs = 1;
 		printf("SW_LOAD: get bootargs %s\n", bootargs);
 		return 0;
-	} else
-		return -1;
+	}
+	return -1;
 }
 
 char*
@@ -125,8 +165,7 @@ check_image(char *path, size_t size_limit, size_t *size)
 	fp = fopen(path, "r");
 
 	if (fp == NULL) {
-		fprintf(stderr,
-			"SW_LOAD ERR: image file failed to open\n");
+		pr_err("SW_LOAD ERR: image file failed to open\n");
 		return -1;
 	}
 
@@ -134,8 +173,7 @@ check_image(char *path, size_t size_limit, size_t *size)
 	len = ftell(fp);
 
 	if (len == 0 || (size_limit && len > size_limit)) {
-		fprintf(stderr,
-			"SW_LOAD ERR: file is %s\n",
+		pr_err("SW_LOAD ERR: file is %s\n",
 			len ? "too large" : "empty");
 		fclose(fp);
 		return -1;
@@ -204,34 +242,43 @@ add_e820_entry(struct e820_entry *e820, int len, uint64_t start,
 uint32_t
 acrn_create_e820_table(struct vmctx *ctx, struct e820_entry *e820)
 {
-	uint32_t k;
+	uint32_t removed = 0, k;
 
 	memcpy(e820, e820_default_entries, sizeof(e820_default_entries));
+	e820[LOWRAM_E820_ENTRY].length = ctx->lowmem -
+			e820[LOWRAM_E820_ENTRY].baseaddr;
 
-	if (ctx->lowmem > 0) {
-		e820[LOWRAM_E820_ENTRIES].length = ctx->lowmem -
-				e820[LOWRAM_E820_ENTRIES].baseaddr;
-		e820[LOWRAM_E820_ENTRIES+1].baseaddr = ctx->lowmem;
-		e820[LOWRAM_E820_ENTRIES+1].length =
+	/* remove [lowmem, lowmem_limit) if it's empty */
+	if (ctx->lowmem_limit > ctx->lowmem) {
+		e820[LOWRAM_E820_ENTRY+1].baseaddr = ctx->lowmem;
+		e820[LOWRAM_E820_ENTRY+1].length =
 			ctx->lowmem_limit - ctx->lowmem;
+	} else {
+		memmove(&e820[LOWRAM_E820_ENTRY+1], &e820[LOWRAM_E820_ENTRY+2],
+				sizeof(e820[LOWRAM_E820_ENTRY+2]) *
+				(NUM_E820_ENTRIES - (LOWRAM_E820_ENTRY+2)));
+		removed++;
 	}
 
+	/* remove [5GB, highmem) if it's empty */
 	if (ctx->highmem > 0) {
-		e820[HIGHRAM_E820_ENTRIES].type = E820_TYPE_RAM;
-		e820[HIGHRAM_E820_ENTRIES].length = ctx->highmem;
+		e820[HIGHRAM_E820_ENTRY - removed].type = E820_TYPE_RAM;
+		e820[HIGHRAM_E820_ENTRY - removed].length = ctx->highmem;
+	} else {
+		removed++;
 	}
 
-	printf("SW_LOAD: build e820 %d entries to addr: %p\r\n",
-			NUM_E820_ENTRIES, (void *)e820);
+	pr_info("SW_LOAD: build e820 %d entries to addr: %p\r\n",
+			NUM_E820_ENTRIES - removed, (void *)e820);
 
-	for (k = 0; k < NUM_E820_ENTRIES; k++)
-		printf("SW_LOAD: entry[%d]: addr 0x%016lx, size 0x%016lx, "
+	for (k = 0; k < NUM_E820_ENTRIES - removed; k++)
+		pr_info("SW_LOAD: entry[%d]: addr 0x%016lx, size 0x%016lx, "
 				" type 0x%x\r\n",
 				k, e820[k].baseaddr,
 				e820[k].length,
 				e820[k].type);
 
-	return  NUM_E820_ENTRIES;
+	return (NUM_E820_ENTRIES - removed);
 }
 
 int

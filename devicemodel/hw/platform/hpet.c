@@ -31,10 +31,11 @@
  */
 
 #include <pthread.h>
-#include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <err.h>
+#include <sysexits.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -58,18 +59,22 @@
  */
 #define	VHPET_NUM_TIMERS	(8)
 
-#define	VHPET_LOCK()							\
-	do {										\
-		int err;								\
-		err = pthread_mutex_lock(&vhpet_mtx);	\
-		assert(err == 0);						\
+#define	VHPET_LOCK()												\
+	do {															\
+		int err;													\
+		err = pthread_mutex_lock(&vhpet_mtx);						\
+		if (err)													\
+			errx(EX_SOFTWARE, "pthread_mutex_lock returned %s",		\
+					strerror(err));									\
 	} while (0)
 
-#define	VHPET_UNLOCK()							\
-	do {										\
-		int err;								\
-		err = pthread_mutex_unlock(&vhpet_mtx);	\
-		assert(err == 0);						\
+#define	VHPET_UNLOCK()												\
+	do {															\
+		int err;													\
+		err = pthread_mutex_unlock(&vhpet_mtx);						\
+		if (err)													\
+			errx(EX_SOFTWARE, "pthread_mutex_unlock returned %s",	\
+					strerror(err));									\
 	} while (0)
 
 #define vhpet_ts_to_ticks(ts)	ts_to_ticks(HPET_FREQ, ts)
@@ -90,13 +95,20 @@ static int hpet_debug;
 #define WPRINTF(params)	(printf params)
 
 
+static struct mem_range vhpet_mr = {
+	.name = "vhpet",
+	.base = VHPET_BASE,
+	.size = VHPET_SIZE,
+	.flags = MEM_F_RW
+};
+
 struct vhpet_timer_arg {
 	struct vhpet	*vhpet;
 	int	timer_num;
 	bool	running;
 };
 
-static struct vhpet {
+struct vhpet {
 	struct vmctx	*vm;
 	bool	inited;
 
@@ -117,7 +129,7 @@ static struct vhpet {
 		} tmrlst[3];
 		int	tmridx;
 	} timer[VHPET_NUM_TIMERS];
-} __vhpet;	/* one vHPET per VM */
+};
 
 
 /* one vHPET per VM */
@@ -126,9 +138,12 @@ static pthread_mutex_t vhpet_mtx = PTHREAD_MUTEX_INITIALIZER;
 static const struct itimerspec zero_ts = { 0 };
 
 
-static inline struct vhpet *
+/* one vHPET per VM */
+static struct vhpet *
 vhpet_instance(void)
 {
+	static struct vhpet __vhpet;
+
 	return &__vhpet;
 }
 
@@ -186,13 +201,15 @@ vhpet_counter(struct vhpet *vhpet, struct timespec *nowptr)
 	val = vhpet->countbase;
 
 	if (vhpet_counter_enabled(vhpet)) {
-		if (clock_gettime(CLOCK_REALTIME, &now)) {
-			perror("clock_gettime failed");
-			assert(0);
-		}
+		if (clock_gettime(CLOCK_REALTIME, &now))
+			errx(EX_SOFTWARE, "clock_gettime returned: %s", strerror(errno));
 
 		/* delta = now - countbase_ts */
-		assert(timespeccmp(&now, &vhpet->countbase_ts, >=));
+		if (timespeccmp(&now, &vhpet->countbase_ts, <)) {
+			warnx("vhpet counter going backwards");
+			vhpet->countbase_ts = now;
+		}
+
 		delta = now;
 		timespecsub(&delta, &vhpet->countbase_ts);
 		val += vhpet_ts_to_ticks(&delta);
@@ -202,10 +219,15 @@ vhpet_counter(struct vhpet *vhpet, struct timespec *nowptr)
 	} else {
 		/*
 		 * The timespec corresponding to the 'countbase' is
-		 * meaningless when the counter is disabled. Make sure
-		 * that the caller doesn't want to use it.
+		 * meaningless when the counter is disabled. Warn if
+		 * the caller wants to use it.
 		 */
-		assert(nowptr == NULL);
+		if (nowptr) {
+			warnx("vhpet unexpected nowptr");
+			if (clock_gettime(CLOCK_REALTIME, nowptr))
+				errx(EX_SOFTWARE, "clock_gettime returned: %s",
+						strerror(errno));
+		}
 	}
 
 	return val;
@@ -218,8 +240,12 @@ vhpet_timer_clear_isr(struct vhpet *vhpet, int n)
 
 	if (vhpet->isr & (1 << n)) {
 		pin = vhpet_timer_ioapic_pin(vhpet, n);
-		assert(pin != 0);
-		vm_set_gsi_irq(vhpet->vm, pin, GSI_SET_LOW);
+
+		if (pin)
+			vm_set_gsi_irq(vhpet->vm, pin, GSI_SET_LOW);
+		else
+			warnx("vhpet t%d intr asserted without a valid intr route", n);
+
 		vhpet->isr &= ~(1 << n);
 	}
 }
@@ -253,8 +279,8 @@ vhpet_timer_running(struct vhpet *vhpet, int n)
 static inline bool
 vhpet_timer_edge_trig(struct vhpet *vhpet, int n)
 {
-	assert(!vhpet_timer_msi_enabled(vhpet, n));
-	return ((vhpet->timer[n].cap_config & HPET_TCNF_INT_TYPE) == 0);
+	return (!vhpet_timer_msi_enabled(vhpet, n) &&
+	        (vhpet->timer[n].cap_config & HPET_TCNF_INT_TYPE) == 0);
 }
 
 static void
@@ -269,10 +295,17 @@ vhpet_timer_interrupt(struct vhpet *vhpet, int n)
 	/*
 	 * If a level triggered interrupt is already asserted then just return.
 	 */
-	if ((vhpet->isr & (1 << n)) != 0) {
-		assert(!vhpet_timer_edge_trig(vhpet, n));
-		DPRINTF(("hpet t%d intr is already asserted\n", n));
-		return;
+	if (vhpet->isr & (1 << n)) {
+		if (!vhpet_timer_msi_enabled(vhpet, n) &&
+		    !vhpet_timer_edge_trig(vhpet, n)) {
+			DPRINTF(("hpet t%d intr is already asserted\n", n));
+			return;
+		} else {
+			warnx("vhpet t%d intr asserted in %s mode", n,
+					vhpet_timer_msi_enabled(vhpet, n) ?
+					"msi" : "edge-triggered");
+			vhpet->isr &= ~(1 << n);
+		}
 	}
 
 	if (vhpet_timer_msi_enabled(vhpet, n)) {
@@ -321,23 +354,27 @@ vhpet_timer_handler(void *a, uint64_t nexp)
 	/* Bail if timer was stopped */
 	if (!arg->running) {
 		DPRINTF(("hpet t%d(%p) already stopped\n", n, arg));
-		assert(ts_is_zero(&vhpet->timer[n].expts));
+		if (!ts_is_zero(&vhpet->timer[n].expts)) {
+			warnx("vhpet t%d stopped with an expiration time", n);
+			ts_set_zero(&vhpet->timer[n].expts);
+		}
 		goto done;
-	} else
-		assert(arg == vhpet_tmrarg(vhpet, n));
+	} else if (arg != vhpet_tmrarg(vhpet, n)) {
+		warnx("vhpet t%d observes a stale timer arg", n);
+		goto done;
+	}
 
 	vhpet_timer_interrupt(vhpet, n);
 
-	if (clock_gettime(CLOCK_REALTIME, &now)) {
-		perror("clock_gettime failed");
-		assert(0);
-	}
+	if (clock_gettime(CLOCK_REALTIME, &now))
+		errx(EX_SOFTWARE, "clock_gettime returned: %s", strerror(errno));
 
 	if (acrn_timer_gettime(vhpet_tmr(vhpet, n), &tmrts))
-		assert(0);
+		errx(EX_SOFTWARE, "acrn_timer_gettime returned: %s", strerror(errno));
 
 	/* One-shot mode has a periodicity of 2^32 ticks */
-	assert(!ts_is_zero(&tmrts.it_interval));
+	if (ts_is_zero(&tmrts.it_interval))
+		warnx("vhpet t%d has no periodicity", n);
 
 	/*
 	 * The actual expiration time will be slightly later than expts.
@@ -376,8 +413,8 @@ vhpet_adjust_compval(struct vhpet *vhpet, int n, const struct timespec *now)
 	compval = vhpet->timer[n].compval;
 	comprate = vhpet->timer[n].comprate;
 
-	assert(comprate != 0);
-	assert(timespeccmp(&vhpet->timer[n].expts, now, <));
+	if (!comprate || timespeccmp(&vhpet->timer[n].expts, now, >=))
+		return;
 
 	/* delta = now - expts */
 	delta = *now;
@@ -410,8 +447,11 @@ vhpet_stop_timer(struct vhpet *vhpet, int n, const struct timespec *now,
 {
 	struct vhpet_timer_arg *arg;
 
-	assert(vhpet_timer_running(vhpet, n));
-	assert(!ts_is_zero(&vhpet->timer[n].expts));
+	if (!vhpet_timer_running(vhpet, n))
+		return;
+
+	if (ts_is_zero(&vhpet->timer[n].expts))
+		warnx("vhpet t%d is running without an expiration time", n);
 
 	DPRINTF(("hpet t%d stopped\n", n));
 
@@ -420,12 +460,16 @@ vhpet_stop_timer(struct vhpet *vhpet, int n, const struct timespec *now,
 
 	/* Cancel the existing timer */
 	if (acrn_timer_settime(vhpet_tmr(vhpet, n), &zero_ts))
-		assert(0);
+		errx(EX_SOFTWARE, "acrn_timer_settime returned: %s", strerror(errno));
 
 	if (++vhpet->timer[n].tmridx == nitems(vhpet->timer[n].tmrlst))
 		vhpet->timer[n].tmridx = 0;
 
-	assert(!vhpet_timer_running(vhpet, n));
+	if (vhpet_timer_running(vhpet, n)) {
+		warnx("vhpet t%d timer %d is still running",
+				n, vhpet->timer[n].tmridx);
+		vhpet_stop_timer(vhpet, n, &zero_ts.it_value, false);
+	}
 
 	/*
 	 * If the timer was scheduled to expire in the past but hasn't
@@ -434,15 +478,17 @@ vhpet_stop_timer(struct vhpet *vhpet, int n, const struct timespec *now,
 	 * in the guest. This is especially bad in one-shot mode because
 	 * the next interrupt has to wait for the counter to wrap around.
 	 */
-	if (timespeccmp(&vhpet->timer[n].expts, now, <)) {
-		DPRINTF(("hpet t%d interrupt triggered after "
-		         "stopping timer\n", n));
-		if (adj_compval && vhpet->timer[n].comprate != 0)
-			vhpet_adjust_compval(vhpet, n, now);
-		vhpet_timer_interrupt(vhpet, n);
-	}
+	if (!ts_is_zero(&vhpet->timer[n].expts)) {
+		if (timespeccmp(&vhpet->timer[n].expts, now, <)) {
+			DPRINTF(("hpet t%d interrupt triggered after "
+					 "stopping timer\n", n));
+			if (adj_compval)
+				vhpet_adjust_compval(vhpet, n, now);
+			vhpet_timer_interrupt(vhpet, n);
+		}
 
-	ts_set_zero(&vhpet->timer[n].expts);
+		ts_set_zero(&vhpet->timer[n].expts);
+	}
 }
 
 static void
@@ -453,8 +499,7 @@ vhpet_start_timer(struct vhpet *vhpet, int n, uint32_t counter,
 	uint32_t delta;
 	struct vhpet_timer_arg *arg;
 
-	if (vhpet_timer_running(vhpet, n))
-		vhpet_stop_timer(vhpet, n, now, adj_compval);
+	vhpet_stop_timer(vhpet, n, now, adj_compval);
 
 	DPRINTF(("hpet t%d started\n", n));
 
@@ -474,14 +519,13 @@ vhpet_start_timer(struct vhpet *vhpet, int n, uint32_t counter,
 		vhpet_ticks_to_ts(1ULL << 32, &ts.it_interval);
 
 	arg = vhpet_tmrarg(vhpet, n);
-	assert(!arg->running);
 	arg->running = true;
 
 	/* Arm the new timer */
 	if (acrn_timer_settime_abs(vhpet_tmr(vhpet, n), &ts))
-		assert(0);
+		errx(EX_SOFTWARE, "acrn_timer_settime_abs returned: %s",
+				strerror(errno));
 
-	assert(ts_is_zero(&vhpet->timer[n].expts));
 	vhpet->timer[n].expts = ts.it_value;
 }
 
@@ -504,18 +548,18 @@ vhpet_start_counting(struct vhpet *vhpet)
 {
 	int i;
 
-	if (clock_gettime(CLOCK_REALTIME, &vhpet->countbase_ts)) {
-		perror("clock_gettime failed");
-		assert(0);
-	}
+	if (clock_gettime(CLOCK_REALTIME, &vhpet->countbase_ts))
+		errx(EX_SOFTWARE, "clock_gettime returned: %s", strerror(errno));
 
 	/* Restart the timers based on the main counter base value */
 	for (i = 0; i < VHPET_NUM_TIMERS; i++) {
 		if (vhpet_timer_enabled(vhpet, i))
 			vhpet_start_timer(vhpet, i, vhpet->countbase,
 					&vhpet->countbase_ts, true);
-		else
-			assert(!vhpet_timer_running(vhpet, i));
+		else if (vhpet_timer_running(vhpet, i)) {
+			warnx("vhpet t%d's timer is disabled but running", i);
+			vhpet_stop_timer(vhpet, i, &zero_ts.it_value, false);
+		}
 	}
 }
 
@@ -531,8 +575,10 @@ vhpet_stop_counting(struct vhpet *vhpet, uint32_t counter,
 	for (i = 0; i < VHPET_NUM_TIMERS; i++) {
 		if (vhpet_timer_enabled(vhpet, i))
 			vhpet_stop_timer(vhpet, i, now, true);
-		else
-			assert(!vhpet_timer_running(vhpet, i));
+		else if (vhpet_timer_running(vhpet, i)) {
+			warnx("vhpet t%d's timer is disabled but running", i);
+			vhpet_stop_timer(vhpet, i, &zero_ts.it_value, false);
+		}
 	}
 }
 
@@ -554,8 +600,14 @@ vhpet_timer_update_config(struct vhpet *vhpet, int n, uint64_t data,
 	struct timespec now;
 
 	if (vhpet_timer_msi_enabled(vhpet, n) ||
-	    vhpet_timer_edge_trig(vhpet, n))
-		assert(!(vhpet->isr & (1 << n)));
+	    vhpet_timer_edge_trig(vhpet, n)) {
+		if (vhpet->isr & (1 << n)) {
+			warnx("vhpet t%d intr asserted in %s mode", n,
+					vhpet_timer_msi_enabled(vhpet, n) ?
+					"msi" : "edge-triggered");
+			vhpet->isr &= ~(1 << n);
+		}
+	}
 
 	old_pin = vhpet_timer_ioapic_pin(vhpet, n);
 	oldval = vhpet->timer[n].cap_config;
@@ -587,10 +639,9 @@ vhpet_timer_update_config(struct vhpet *vhpet, int n, uint64_t data,
 			 *   - Timer remains in periodic mode
 			 */
 			if (!vhpet_timer_enabled(vhpet, n)) {
-				if (clock_gettime(CLOCK_REALTIME, &now)) {
-					perror("clock_gettime failed");
-					assert(0);
-				}
+				if (clock_gettime(CLOCK_REALTIME, &now))
+					errx(EX_SOFTWARE, "clock_gettime returned: %s",
+							strerror(errno));
 				vhpet_stop_timer(vhpet, n, &now, true);
 			} else if (!(oldval & (HPET_TCNF_TYPE | HPET_TCNF_INT_ENB)) ||
 			           ((oldval ^ newval) & HPET_TCNF_TYPE))
@@ -623,8 +674,10 @@ vhpet_timer_update_config(struct vhpet *vhpet, int n, uint64_t data,
 	 * not remain asserted forever.
 	 */
 	if (vhpet->isr & (1 << n)) {
-		assert(old_pin != 0);
-		if (!vhpet_timer_interrupt_enabled(vhpet, n) ||
+		if (!old_pin) {
+			warnx("vhpet t%d intr asserted without a valid intr route", n);
+			vhpet->isr &= ~(1 << n);
+		} else if (!vhpet_timer_interrupt_enabled(vhpet, n) ||
 		    vhpet_timer_msi_enabled(vhpet, n) ||
 		    vhpet_timer_edge_trig(vhpet, n) ||
 		    new_pin != old_pin) {
@@ -753,7 +806,11 @@ vhpet_mmio_write(struct vhpet *vhpet, int vcpuid, uint64_t gpa, uint64_t *wval,
 				     HPET_TCNF_VAL_SET) != 0)
 					vhpet->timer[i].compval = val64;
 			} else {
-				assert(vhpet->timer[i].comprate == 0);
+				if (vhpet->timer[i].comprate) {
+					warnx("vhpet t%d's comprate is %u in non-periodic mode"
+							" - should be 0", i, vhpet->timer[i].comprate);
+					vhpet->timer[i].comprate = 0;
+				}
 				val64 = vhpet->timer[i].compval;
 				update_register(&val64, data, mask);
 				vhpet->timer[i].compval = val64;
@@ -906,7 +963,6 @@ vhpet_init(struct vmctx *ctx)
 	uint64_t allowed_irqs;
 	struct vhpet_timer_arg *arg;
 	struct acrn_timer *tmr;
-	struct mem_range mr;
 
 	vhpet = vhpet_instance();
 
@@ -955,15 +1011,11 @@ vhpet_init(struct vmctx *ctx)
 		}
 	}
 
-	mr.name = "vhpet";
-	mr.base = VHPET_BASE;
-	mr.size = VHPET_SIZE;
-	mr.flags = MEM_F_RW;
-	mr.handler = vhpet_handler;
-	mr.arg1 = vhpet;
-	mr.arg2 = 0;
+	vhpet_mr.handler = vhpet_handler;
+	vhpet_mr.arg1 = vhpet;
+	vhpet_mr.arg2 = 0;
 
-	error = register_mem(&mr);
+	error = register_mem(&vhpet_mr);
 
 	if (error) {
 		vhpet_deinit_timers(vhpet);
@@ -990,6 +1042,8 @@ vhpet_deinit(struct vmctx *ctx)
 		goto done;
 
 	vhpet_deinit_timers(vhpet);
+	unregister_mem(&vhpet_mr);
+
 	vhpet->inited = false;
 
 done:

@@ -5,7 +5,7 @@ ACRN documentation generation
 
 These instructions will walk you through generating the Project ACRN's
 documentation and publishing it to https://projectacrn.github.io.
-You can also use these instructions to generate the ARCN documentation
+You can also use these instructions to generate the ACRN documentation
 on your local system.
 
 Documentation overview
@@ -25,8 +25,8 @@ The project's documentation contains the following items:
 
 * ReStructuredText source files used to generate documentation found at the
   http://projectacrn.github.io website. All of the reStructuredText sources
-  are found in the acrn-hypervisor/doc folder, or pulled in from sibling
-  folders (such as /tools/) by the build scripts.
+  are found in the ``acrn-hypervisor/doc`` folder, or pulled in from sibling
+  folders (such as ``misc/``) by the build scripts.
 
 * Doxygen-generated material used to create all API-specific documents
   found at http://projectacrn.github.io/latest/api/.  The doc build
@@ -67,12 +67,13 @@ folder setup for documentation contributions and generation:
          devicemodel/
          doc/
          hypervisor/
+         misc/
       acrn-kernel/
 
 The parent projectacrn folder is there because we'll also be creating a
 publishing area later in these steps.  For API doc generation, we'll also
 need the acrn-kernel repo contents in a sibling folder to the
-acrn-hypervisor repo contents. 
+acrn-hypervisor repo contents.
 
 It's best if the acrn-hypervisor
 folder is an ssh clone of your personal fork of the upstream project
@@ -136,9 +137,6 @@ Our documentation processing has been tested to run with:
 * sphinx_rtd_theme version 0.4.0
 
 Depending on your Linux version, install the needed tools:
-
-* For Clear Linux: follow the :ref:`getting-started-apl-nuc` to install
-  all the tools required
 
 * For Ubuntu use:
 
@@ -282,7 +280,7 @@ folder.  Note that there's no direct selection to go to a newer version
 from an older one, without going to ``latest`` first.
 
 By default, doc build and publishing assumes we're generating
-documentation for the master branch and publishing to the ``/latest/``
+documentation for the main branch and publishing to the ``/latest/``
 area on https://projectacrn.github.io. When we're generating the
 documentation for a tagged version (e.g., 0.2), check out that version
 of the repo, and add some extra flags to the make commands:

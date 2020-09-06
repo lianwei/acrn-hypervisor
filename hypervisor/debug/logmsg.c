@@ -4,8 +4,14 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
+#include <types.h>
+#include <atomic.h>
+#include <sprintf.h>
+#include <spinlock.h>
 #include <per_cpu.h>
+#include <npk_log.h>
+#include <logmsg.h>
+
 /* buf size should be identical to the size in hvlog option, which is
  * transfered to SOS:
  * bsp/uefi/clearlinux/acrn.conf: hvlog=2M@0x1FE00000
@@ -23,6 +29,8 @@ void init_logmsg(uint32_t flags)
 {
 	logmsg_ctl.flags = flags;
 	logmsg_ctl.seq = 0;
+
+	spinlock_init(&(logmsg_ctl.lock));
 }
 
 void do_logmsg(uint32_t severity, const char *fmt, ...)
@@ -34,6 +42,7 @@ void do_logmsg(uint32_t severity, const char *fmt, ...)
 	bool do_mem_log;
 	bool do_npk_log;
 	char *buffer;
+	struct thread_object *current;
 
 	do_console_log = (((logmsg_ctl.flags & LOG_FLAG_STDOUT) != 0U) && (severity <= console_loglevel));
 	do_mem_log = (((logmsg_ctl.flags & LOG_FLAG_MEMORY) != 0U) && (severity <= mem_loglevel));
@@ -50,13 +59,14 @@ void do_logmsg(uint32_t severity, const char *fmt, ...)
 	timestamp = ticks_to_us(timestamp);
 
 	/* Get CPU ID */
-	pcpu_id = get_cpu_id();
+	pcpu_id = get_pcpu_id();
 	buffer = per_cpu(logbuf, pcpu_id);
+	current = sched_get_current(pcpu_id);
 
 	(void)memset(buffer, 0U, LOG_MESSAGE_MAX_SIZE);
 	/* Put time-stamp, CPU ID and severity into buffer */
-	snprintf(buffer, LOG_MESSAGE_MAX_SIZE, "[%lluus][cpu=%hu][sev=%u][seq=%u]:",
-			timestamp, pcpu_id, severity, atomic_inc_return(&logmsg_ctl.seq));
+	snprintf(buffer, LOG_MESSAGE_MAX_SIZE, "[%luus][cpu=%hu][%s][sev=%u][seq=%u]:",
+			timestamp, pcpu_id, current->name, severity, atomic_inc_return(&logmsg_ctl.seq));
 
 	/* Put message into remaining portion of local buffer */
 	va_start(args, fmt);
@@ -83,7 +93,7 @@ void do_logmsg(uint32_t severity, const char *fmt, ...)
 	/* Check if flags specify to output to memory */
 	if (do_mem_log) {
 		uint32_t i, msg_len;
-		struct shared_buf *sbuf = (struct shared_buf *)per_cpu(sbuf, pcpu_id)[ACRN_HVLOG];
+		struct shared_buf *sbuf = per_cpu(sbuf, pcpu_id)[ACRN_HVLOG];
 
 		/* If sbuf is not ready, we just drop the massage */
 		if (sbuf != NULL) {

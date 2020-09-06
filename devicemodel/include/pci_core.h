@@ -32,11 +32,23 @@
 #include <sys/queue.h>
 
 #include <assert.h>
+#include <stdbool.h>
 #include "types.h"
 #include "pcireg.h"
+#include "log.h"
 
 #define	PCI_BARMAX	PCIR_MAX_BAR_0	/* BAR registers in a Type 0 header */
 #define	PCI_BDF(b, d, f) (((b & 0xFF) << 8) | ((d & 0x1F) << 3) | ((f & 0x7)))
+
+#define	PCI_EMUL_ECFG_BASE	0xE0000000UL	/* 3.5GB */
+
+#define	PCI_EMUL_MEMBASE64	0x100000000UL	/* 4GB */
+#define	PCI_EMUL_MEMLIMIT64	0x140000000UL	/* 5GB */
+
+/* Currently,only gvt need reserved bar regions,
+ * so just hardcode REGION_NUMS=5 here
+ */
+#define REGION_NUMS 5
 
 struct vmctx;
 struct pci_vdev;
@@ -94,6 +106,7 @@ struct pcibar {
 	enum pcibar_type	type;		/* io or memory */
 	uint64_t		size;
 	uint64_t		addr;
+	bool			sizing;
 };
 
 #define PI_NAMESZ	40
@@ -230,6 +243,20 @@ struct pciecap {
 } __attribute__((packed));
 static_assert(sizeof(struct pciecap) == 60, "compile-time assertion failed");
 
+struct mmio_rsvd_rgn {
+	uint64_t start;
+	uint64_t end;
+	int idx;
+	int bar_type;
+	/* if vdev=NULL, it also indicates this mmio_rsvd_rgn is not used */
+	struct pci_vdev *vdev;
+};
+
+extern struct mmio_rsvd_rgn reserved_bar_regions[REGION_NUMS];
+int create_mmio_rsvd_rgn(uint64_t start,
+                uint64_t end, int idx, int bar_type, struct pci_vdev *vdev);
+void destory_mmio_rsvd_rgns(struct pci_vdev *vdev);
+
 typedef void (*pci_lintr_cb)(int b, int s, int pin, int pirq_pin,
 			     int ioapic_irq, void *arg);
 
@@ -245,6 +272,7 @@ int	pci_emul_alloc_bar(struct pci_vdev *pdi, int idx,
 int	pci_emul_alloc_pbar(struct pci_vdev *pdi, int idx,
 			    uint64_t hostbase, enum pcibar_type type,
 			    uint64_t size);
+void	pci_emul_free_bar(struct pci_vdev *pdi, int idx);
 void	pci_emul_free_bars(struct pci_vdev *pdi);
 int	pci_emul_add_capability(struct pci_vdev *dev, u_char *capdata,
 				int caplen);
@@ -299,7 +327,7 @@ int	pci_msix_table_bar(struct pci_vdev *pi);
 int	pci_msix_pba_bar(struct pci_vdev *pi);
 int	pci_msi_maxmsgnum(struct pci_vdev *pi);
 int	pci_parse_slot(char *opt);
-void	pci_populate_msicap(struct msicap *cap, int msgs, int nextptr);
+int	pci_populate_msicap(struct msicap *cap, int msgs, int nextptr);
 int	pci_emul_add_msixcap(struct pci_vdev *pi, int msgnum, int barnum);
 int	pci_emul_msix_twrite(struct pci_vdev *pi, uint64_t offset, int size,
 			     uint64_t value);
@@ -307,7 +335,6 @@ uint64_t pci_emul_msix_tread(struct pci_vdev *pi, uint64_t offset, int size);
 int	pci_count_lintr(int bus);
 void	pci_walk_lintr(int bus, pci_lintr_cb cb, void *arg);
 void	pci_write_dsdt(void);
-uint64_t pci_ecfg_base(void);
 int	pci_bus_configured(int bus);
 int	emulate_pci_cfgrw(struct vmctx *ctx, int vcpu, int in, int bus,
 			  int slot, int func, int reg, int bytes, int *value);
@@ -317,6 +344,7 @@ int	check_gsi_sharing_violation(void);
 int	pciaccess_init(void);
 void	pciaccess_cleanup(void);
 int	parse_bdf(char *s, int *bus, int *dev, int *func, int base);
+struct pci_vdev *pci_get_vdev_info(int slot);
 
 
 /**
@@ -331,7 +359,10 @@ int	parse_bdf(char *s, int *bus, int *dev, int *func, int base);
 static inline void
 pci_set_cfgdata8(struct pci_vdev *dev, int offset, uint8_t val)
 {
-	assert(offset <= PCI_REGMAX);
+	if (offset > PCI_REGMAX) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return;
+	}
 	*(uint8_t *)(dev->cfgdata + offset) = val;
 }
 
@@ -347,7 +378,10 @@ pci_set_cfgdata8(struct pci_vdev *dev, int offset, uint8_t val)
 static inline void
 pci_set_cfgdata16(struct pci_vdev *dev, int offset, uint16_t val)
 {
-	assert(offset <= (PCI_REGMAX - 1) && (offset & 1) == 0);
+	if ((offset > PCI_REGMAX - 1) || (offset & 1) != 0) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return;
+	}
 	*(uint16_t *)(dev->cfgdata + offset) = val;
 }
 
@@ -363,7 +397,10 @@ pci_set_cfgdata16(struct pci_vdev *dev, int offset, uint16_t val)
 static inline void
 pci_set_cfgdata32(struct pci_vdev *dev, int offset, uint32_t val)
 {
-	assert(offset <= (PCI_REGMAX - 3) && (offset & 3) == 0);
+	if ((offset > PCI_REGMAX - 3) || (offset & 3) != 0) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return;
+	}
 	*(uint32_t *)(dev->cfgdata + offset) = val;
 }
 
@@ -378,7 +415,10 @@ pci_set_cfgdata32(struct pci_vdev *dev, int offset, uint32_t val)
 static inline uint8_t
 pci_get_cfgdata8(struct pci_vdev *dev, int offset)
 {
-	assert(offset <= PCI_REGMAX);
+	if (offset > PCI_REGMAX) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return 0xff;
+	}
 	return (*(uint8_t *)(dev->cfgdata + offset));
 }
 
@@ -393,7 +433,10 @@ pci_get_cfgdata8(struct pci_vdev *dev, int offset)
 static inline uint16_t
 pci_get_cfgdata16(struct pci_vdev *dev, int offset)
 {
-	assert(offset <= (PCI_REGMAX - 1) && (offset & 1) == 0);
+	if ((offset > PCI_REGMAX - 1) || (offset & 1) != 0) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return 0xffff;
+	}
 	return (*(uint16_t *)(dev->cfgdata + offset));
 }
 
@@ -408,7 +451,10 @@ pci_get_cfgdata16(struct pci_vdev *dev, int offset)
 static inline uint32_t
 pci_get_cfgdata32(struct pci_vdev *dev, int offset)
 {
-	assert(offset <= (PCI_REGMAX - 3) && (offset & 3) == 0);
+	if ((offset > PCI_REGMAX - 3) || (offset & 3) != 0) {
+		pr_err("%s: out of range of PCI config space!\n", __func__);
+		return 0xffffffff;
+	}
 	return (*(uint32_t *)(dev->cfgdata + offset));
 }
 

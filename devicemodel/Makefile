@@ -2,6 +2,8 @@
 # ACRN-DM
 #
 include ../VERSION
+include ../paths.make
+
 FULL_VERSION=$(MAJOR_VERSION).$(MINOR_VERSION)$(EXTRA_VERSION)
 BASEDIR := $(shell pwd)
 DM_OBJDIR ?= $(CURDIR)/build
@@ -9,6 +11,7 @@ DM_BUILD_VERSION ?=
 DM_BUILD_TAG ?=
 
 CC ?= gcc
+RELEASE ?= 0
 
 CFLAGS := -g -O0 -std=gnu11
 CFLAGS += -D_GNU_SOURCE
@@ -16,14 +19,20 @@ CFLAGS += -DNO_OPENSSL
 CFLAGS += -m64
 CFLAGS += -Wall -ffunction-sections
 CFLAGS += -Werror
-CFLAGS += -O2 -D_FORTIFY_SOURCE=2
+CFLAGS += -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 CFLAGS += -Wformat -Wformat-security -fno-strict-aliasing
+CFLAGS += -fno-delete-null-pointer-checks -fwrapv
 CFLAGS += -fpie
+CFLAGS += -Wno-stringop-truncation -Wno-address-of-packed-member
 
 CFLAGS += -I$(BASEDIR)/include
 CFLAGS += -I$(BASEDIR)/include/public
 CFLAGS += -I$(DM_OBJDIR)/include
 CFLAGS += -I$(TOOLS_OUT)
+
+ifneq (, $(DM_ASL_COMPILER))
+CFLAGS += -DASL_COMPILER=\"$(DM_ASL_COMPILER)\"
+endif
 
 GCC_MAJOR=$(shell echo __GNUC__ | $(CC) -E -x c - | tail -n 1)
 GCC_MINOR=$(shell echo __GNUC_MINOR__ | $(CC) -E -x c - | tail -n 1)
@@ -43,6 +52,13 @@ endif
 endif
 endif
 
+ifeq ($(RELEASE),0)
+CFLAGS += -DDM_DEBUG
+else
+LDFLAGS += -s
+endif
+
+
 LDFLAGS += -Wl,-z,noexecstack
 LDFLAGS += -Wl,-z,relro,-z,now
 LDFLAGS += -pie
@@ -52,7 +68,6 @@ LIBS = -lrt
 LIBS += -lpthread
 LIBS += -lcrypto
 LIBS += -lpciaccess
-LIBS += -lz
 LIBS += -luuid
 LIBS += -lusb-1.0
 LIBS += -lacrn-mngr
@@ -79,10 +94,12 @@ SRCS += hw/platform/ioapic.c
 SRCS += hw/platform/cmos_io.c
 SRCS += hw/platform/ioc.c
 SRCS += hw/platform/ioc_cbc.c
+SRCS += hw/platform/pty_vuart.c
 SRCS += hw/platform/acpi/acpi.c
 SRCS += hw/platform/acpi/acpi_pm.c
 SRCS += hw/platform/rpmb/rpmb_sim.c
 SRCS += hw/platform/rpmb/rpmb_backend.c
+SRCS += hw/platform/rpmb/att_keybox.c
 SRCS += hw/platform/tpm/tpm_emulator.c
 SRCS += hw/platform/tpm/tpm_crb.c
 SRCS += hw/platform/tpm/tpm.c
@@ -94,6 +111,7 @@ SRCS += hw/pci/core.c
 SRCS += hw/pci/virtio/virtio_console.c
 SRCS += hw/pci/virtio/virtio_block.c
 SRCS += hw/pci/virtio/virtio_input.c
+SRCS += hw/pci/virtio/virtio_i2c.c
 SRCS += hw/pci/ahci.c
 SRCS += hw/pci/hostbridge.c
 SRCS += hw/pci/platform_gsi_info.c
@@ -108,10 +126,13 @@ SRCS += hw/pci/virtio/virtio_mei.c
 SRCS += hw/pci/virtio/virtio_coreu.c
 SRCS += hw/pci/virtio/virtio_hdcp.c
 SRCS += hw/pci/virtio/virtio_rpmb.c
+SRCS += hw/pci/virtio/virtio_gpio.c
 SRCS += hw/pci/irq.c
 SRCS += hw/pci/uart.c
 SRCS += hw/pci/gvt.c
 SRCS += hw/pci/npk.c
+SRCS += hw/pci/ivshmem.c
+SRCS += hw/mmio/core.c
 
 # core
 #SRCS += core/bootrom.c
@@ -121,10 +142,10 @@ SRCS += core/sw_load_bzimage.c
 SRCS += core/sw_load_vsbl.c
 SRCS += core/sw_load_ovmf.c
 SRCS += core/sw_load_elf.c
-SRCS += core/smbiostbl.c
 SRCS += core/mevent.c
 SRCS += core/gc.c
 SRCS += core/pm.c
+SRCS += core/pm_vuart.c
 SRCS += core/console.c
 SRCS += core/inout.c
 SRCS += core/mem.c
@@ -138,18 +159,19 @@ SRCS += core/timer.c
 
 # arch
 SRCS += arch/x86/pm.c
+SRCS += arch/x86/power_button.c
 
-# vmcfg
-SRCS += vmcfg/vmcfg.c
-SRCS += vmcfg/apl-mrb/vm1/vm1.c
+# log
+SRCS += log/log.c
+SRCS += log/kmsg_logger.c
+SRCS += log/disk_logger.c
 
 OBJS := $(patsubst %.c,$(DM_OBJDIR)/%.o,$(SRCS))
 
 VERSION_H := $(DM_OBJDIR)/include/version.h
-VMCFG_CONFIG_H := $(DM_OBJDIR)/include/vmcfg_config.h
 
 HEADERS := $(shell find $(BASEDIR) -name '*.h')
-HEADERS += $(VERSION_H) $(VMCFG_CONFIG_H)
+HEADERS += $(VERSION_H)
 
 DISTCLEAN_OBJS := $(shell find $(BASEDIR) -name '*.o')
 
@@ -157,15 +179,12 @@ PROGRAM := acrn-dm
 
 SAMPLES_NUC := $(wildcard samples/nuc/*)
 SAMPLES_MRB := $(wildcard samples/apl-mrb/*)
-SAMPLES_UP2 := $(wildcard samples/up2/*)
+SAMPLES_UP2 := $(wildcard samples/apl-up2/*)
 
 BIOS_BIN := $(wildcard bios/*)
 
 all: $(DM_OBJDIR)/$(PROGRAM)
 	@echo -n ""
-
-$(VMCFG_CONFIG_H):
-	$(MAKE) -C $(BASEDIR)/vmcfg $@ BASEDIR=$(BASEDIR) DM_OBJDIR=$(DM_OBJDIR)
 
 $(DM_OBJDIR)/$(PROGRAM): $(OBJS)
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $^ $(LIBS)
@@ -205,27 +224,26 @@ $(VERSION_H):
 	echo "#define DM_BUILD_TIME "\""$$TIME"\""" >> $(VERSION_H);\
 	echo "#define DM_BUILD_USER "\""$$USER"\""" >> $(VERSION_H)
 
+-include $(OBJS:.o=.d)
+
 $(DM_OBJDIR)/%.o: %.c $(HEADERS)
 	[ ! -e $@ ] && mkdir -p $(dir $@); \
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ -MMD -MT $@
 
-install: $(DM_OBJDIR)/$(PROGRAM) install-samples-nuc install-samples-mrb install-bios install-vmcfg install-samples-up2
-	install -D --mode=0755 $(DM_OBJDIR)/$(PROGRAM) $(DESTDIR)/usr/bin/$(PROGRAM)
+install: $(DM_OBJDIR)/$(PROGRAM) install-samples-nuc install-samples-mrb install-bios install-samples-up2
+	install -D --mode=0755 $(DM_OBJDIR)/$(PROGRAM) $(DESTDIR)$(bindir)/$(PROGRAM)
 
 install-samples-up2: $(SAMPLES_UP2)
-	install -D -t $(DESTDIR)/usr/share/acrn/samples/up2 $^
+	install -D -t $(DESTDIR)$(datadir)/acrn/samples/apl-up2 $^
 
 install-samples-nuc: $(SAMPLES_NUC)
-	install -D -t $(DESTDIR)/usr/share/acrn/samples/nuc $^
+	install -D -t $(DESTDIR)$(datadir)/acrn/samples/nuc $^
 
 install-samples-mrb: $(SAMPLES_MRB)
-	install -D -t $(DESTDIR)/usr/share/acrn/samples/apl-mrb $^
-	install -d $(DESTDIR)/usr/lib/systemd/system/
-	install -p -D -m 0644 ./samples/apl-mrb/acrn_guest.service $(DESTDIR)/usr/lib/systemd/system
+	install -D -t $(DESTDIR)$(datadir)/acrn/samples/apl-mrb $^
+	install -d $(DESTDIR)$(systemd_unitdir)/system/
+	install -p -D -m 0644 ./samples/apl-mrb/acrn_guest.service $(DESTDIR)$(systemd_unitdir)/system
 
 install-bios: $(BIOS_BIN)
-	install -d $(DESTDIR)/usr/share/acrn/bios
-	install -D --mode=0664 -t $(DESTDIR)/usr/share/acrn/bios $^
-
-install-vmcfg:
-	$(MAKE) -C $(BASEDIR)/vmcfg install DESTDIR=$(DESTDIR) BASEDIR=$(BASEDIR)
+	install -d $(DESTDIR)$(datadir)/acrn/bios
+	install -D --mode=0664 -t $(DESTDIR)$(datadir)/acrn/bios $^

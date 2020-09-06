@@ -4,254 +4,170 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
-#include <reloc.h>
-#include <multiboot.h>
+#include <types.h>
+#include <acrn_hv_defs.h>
+#include <page.h>
 #include <e820.h>
+#include <mmu.h>
+#include <boot.h>
+#include <logmsg.h>
+#include <ept.h>
 
 /*
  * e820.c contains the related e820 operations; like HV to get memory info for its MMU setup;
  * and hide HV memory from SOS_VM...
  */
 
-static uint32_t e820_entries_count;
-static struct e820_entry e820[E820_MAX_ENTRIES];
-static struct e820_mem_params e820_mem;
+static uint32_t hv_e820_entries_nr;
+/* Describe the memory layout the hypervisor uses */
+static struct e820_entry hv_e820[E820_MAX_ENTRIES];
+/* Describe the top/bottom/size of the physical memory the hypervisor manages */
+static struct mem_range hv_mem_range;
 
-#define ACRN_DBG_E820	6U
+#define DBG_LEVEL_E820	6U
 
-static void obtain_e820_mem_info(void)
+static void obtain_mem_range_info(void)
 {
 	uint32_t i;
 	struct e820_entry *entry;
 
-	e820_mem.mem_bottom = UINT64_MAX;
-	e820_mem.mem_top = 0x0UL;
-	e820_mem.total_mem_size = 0UL;
-	e820_mem.max_ram_blk_base = 0UL;
-	e820_mem.max_ram_blk_size = 0UL;
+	hv_mem_range.mem_bottom = UINT64_MAX;
+	hv_mem_range.mem_top = 0x0UL;
+	hv_mem_range.total_mem_size = 0UL;
 
-	for (i = 0U; i < e820_entries_count; i++) {
-		entry = &e820[i];
-		if (e820_mem.mem_bottom > entry->baseaddr) {
-			e820_mem.mem_bottom = entry->baseaddr;
+	for (i = 0U; i < hv_e820_entries_nr; i++) {
+		entry = &hv_e820[i];
+
+		if (hv_mem_range.mem_bottom > entry->baseaddr) {
+			hv_mem_range.mem_bottom = entry->baseaddr;
 		}
 
-		if ((entry->baseaddr + entry->length) > e820_mem.mem_top) {
-			e820_mem.mem_top = entry->baseaddr + entry->length;
+		if ((entry->baseaddr + entry->length) > hv_mem_range.mem_top) {
+			hv_mem_range.mem_top = entry->baseaddr + entry->length;
 		}
 
 		if (entry->type == E820_TYPE_RAM) {
-			e820_mem.total_mem_size += entry->length;
-			if (entry->baseaddr == UOS_DEFAULT_START_ADDR) {
-				e820_mem.max_ram_blk_base = entry->baseaddr;
-				e820_mem.max_ram_blk_size = entry->length;
-			}
+			hv_mem_range.total_mem_size += entry->length;
 		}
 	}
 }
 
-/* before boot sos_vm(service OS), call it to hide the HV RAM entry in e820 table from sos_vm */
-void rebuild_sos_vm_e820(void)
+/*
+ * @brief reserve some RAM, hide it from sos_vm, return its start address
+ * @param size_arg Amount of memory to be found and marked reserved
+ * @param max_addr Maximum address below which memory is to be identified
+ *
+ * @pre hv_e820_entries_nr > 0U
+ * @pre (size_arg & 0xFFFU) == 0U
+ * @return base address of the memory region
+ */
+uint64_t e820_alloc_memory(uint32_t size_arg, uint64_t max_addr)
 {
-	uint32_t i;
-	uint64_t entry_start;
-	uint64_t entry_end;
-	uint64_t hv_start_pa = get_hv_image_base();
-	uint64_t hv_end_pa  = hv_start_pa + CONFIG_HV_RAM_SIZE;
-	struct e820_entry *entry, new_entry = {0};
-
-	/* hypervisor mem need be filter out from e820 table
-	 * it's hv itself + other hv reserved mem like vgt etc
-	 */
-	for (i = 0U; i < e820_entries_count; i++) {
-		entry = &e820[i];
-		entry_start = entry->baseaddr;
-		entry_end = entry->baseaddr + entry->length;
-
-		/* No need handle in these cases*/
-		if ((entry->type != E820_TYPE_RAM) || (entry_end <= hv_start_pa) || (entry_start >= hv_end_pa)) {
-			continue;
-		}
-
-		/* filter out hv mem and adjust length of this entry*/
-		if ((entry_start < hv_start_pa) && (entry_end <= hv_end_pa)) {
-			entry->length = hv_start_pa - entry_start;
-			continue;
-		}
-
-		/* filter out hv mem and need to create a new entry*/
-		if ((entry_start < hv_start_pa) && (entry_end > hv_end_pa)) {
-			entry->length = hv_start_pa - entry_start;
-			new_entry.baseaddr = hv_end_pa;
-			new_entry.length = entry_end - hv_end_pa;
-			new_entry.type = E820_TYPE_RAM;
-			continue;
-		}
-
-		/* This entry is within the range of hv mem
-		 * change to E820_TYPE_RESERVED
-		 */
-		if ((entry_start >= hv_start_pa) && (entry_end <= hv_end_pa)) {
-			entry->type = E820_TYPE_RESERVED;
-			continue;
-		}
-
-		if ((entry_start >= hv_start_pa) && (entry_start < hv_end_pa) && (entry_end > hv_end_pa)) {
-			entry->baseaddr = hv_end_pa;
-			entry->length = entry_end - hv_end_pa;
-			continue;
-		}
-	}
-
-	if (new_entry.length > 0UL) {
-		e820_entries_count++;
-		ASSERT(e820_entries_count <= E820_MAX_ENTRIES, "e820 entry overflow");
-		entry = &e820[e820_entries_count - 1];
-		entry->baseaddr = new_entry.baseaddr;
-		entry->length = new_entry.length;
-		entry->type = new_entry.type;
-	}
-
-	e820_mem.total_mem_size -= CONFIG_HV_RAM_SIZE;
-}
-
-/* get some RAM below 1MB in e820 entries, hide it from sos_vm, return its start address */
-uint64_t e820_alloc_low_memory(uint32_t size_arg)
-{
-	uint32_t i;
-	uint32_t size = size_arg;
-	uint64_t ret = ACRN_INVALID_HPA;
+	int32_t i;
+	uint64_t size = size_arg;
+	uint64_t ret = INVALID_HPA;
 	struct e820_entry *entry, *new_entry;
 
-	/* We want memory in page boundary and integral multiple of pages */
-	size = (((size + PAGE_SIZE) - 1U) >> PAGE_SHIFT) << PAGE_SHIFT;
-
-	for (i = 0U; i < e820_entries_count; i++) {
-		entry = &e820[i];
+	for (i = (int32_t)hv_e820_entries_nr - 1; i >= 0; i--) {
+		entry = &hv_e820[i];
 		uint64_t start, end, length;
 
 		start = round_page_up(entry->baseaddr);
 		end = round_page_down(entry->baseaddr + entry->length);
-		length = end - start;
-		length = (end > start) ? (end - start) : 0;
+		length = (end > start) ? (end - start) : 0UL;
 
-		/* Search for available low memory */
-		if ((entry->type != E820_TYPE_RAM) || (length < size) || ((start + size) > MEM_1M)) {
-			continue;
+		if ((entry->type == E820_TYPE_RAM) && (length >= size) && ((start + size) <= max_addr)) {
+
+
+			/* found exact size of e820 entry */
+			if (length == size) {
+				entry->type = E820_TYPE_RESERVED;
+				hv_mem_range.total_mem_size -= size;
+				ret = start;
+			} else {
+
+				/*
+				 * found entry with available memory larger than requested (length > size)
+				 * Reserve memory if
+				 * 1) hv_e820_entries_nr < E820_MAX_ENTRIES
+				 * 2) if end of this "entry" is <= max_addr
+				 *    use memory from end of this e820 "entry".
+				 */
+
+				if ((hv_e820_entries_nr < E820_MAX_ENTRIES) && (end <= max_addr)) {
+
+					new_entry = &hv_e820[hv_e820_entries_nr];
+					new_entry->type = E820_TYPE_RESERVED;
+					new_entry->baseaddr = end - size;
+					new_entry->length = (entry->baseaddr + entry->length) - new_entry->baseaddr;
+					/* Shrink the existing entry and total available memory */
+					entry->length -= new_entry->length;
+					hv_mem_range.total_mem_size -= new_entry->length;
+					hv_e820_entries_nr++;
+
+				        ret = new_entry->baseaddr;
+				}
+			}
+
+			if (ret != INVALID_HPA) {
+				break;
+			}
 		}
-
-		/* found exact size of e820 entry */
-		if (length == size) {
-			entry->type = E820_TYPE_RESERVED;
-			e820_mem.total_mem_size -= size;
-			ret = start;
-			break;
-		}
-
-		/*
-		 * found entry with available memory larger than requested
-		 * allocate memory from the end of this entry at page boundary
-		 */
-		new_entry = &e820[e820_entries_count];
-		new_entry->type = E820_TYPE_RESERVED;
-		new_entry->baseaddr = end - size;
-		new_entry->length = (entry->baseaddr + entry->length) - new_entry->baseaddr;
-
-		/* Shrink the existing entry and total available memory */
-		entry->length -= new_entry->length;
-		e820_mem.total_mem_size -= new_entry->length;
-		e820_entries_count++;
-
-	        ret = new_entry->baseaddr;
-		break;
 	}
 
-	if (ret == ACRN_INVALID_HPA) {
-		pr_fatal("Can't allocate memory under 1M from E820\n");
+	if (ret == INVALID_HPA) {
+		panic("Requested memory from E820 cannot be reserved!!");
 	}
+
 	return ret;
 }
-
 /* HV read multiboot header to get e820 entries info and calc total RAM info */
 void init_e820(void)
 {
 	uint32_t i;
+	uint64_t top_addr_space = CONFIG_PLATFORM_RAM_SIZE + PLATFORM_LO_MMIO_SIZE;
 
-	if (boot_regs[0] == MULTIBOOT_INFO_MAGIC) {
-		struct multiboot_info *mbi = (struct multiboot_info *)(hpa2hva((uint64_t)boot_regs[1]));
+	struct acrn_multiboot_info *mbi = get_multiboot_info();
+	struct multiboot_mmap *mmap = mbi->mi_mmap_entry;
 
-		pr_info("Multiboot info detected\n");
-		if ((mbi->mi_flags & MULTIBOOT_INFO_HAS_MMAP) != 0U) {
-			struct multiboot_mmap *mmap = (struct multiboot_mmap *)hpa2hva((uint64_t)mbi->mi_mmap_addr);
+	hv_e820_entries_nr = mbi->mi_mmap_entries;
 
-			e820_entries_count = mbi->mi_mmap_length / sizeof(struct multiboot_mmap);
-			if (e820_entries_count > E820_MAX_ENTRIES) {
-				pr_err("Too many E820 entries %d\n", e820_entries_count);
-				e820_entries_count = E820_MAX_ENTRIES;
-			}
+	dev_dbg(DBG_LEVEL_E820, "mmap addr 0x%x entries %d\n",
+		mbi->mi_mmap_entry, hv_e820_entries_nr);
 
-			dev_dbg(ACRN_DBG_E820, "mmap length 0x%x addr 0x%x entries %d\n",
-				mbi->mi_mmap_length, mbi->mi_mmap_addr, e820_entries_count);
 
-			for (i = 0U; i < e820_entries_count; i++) {
-				e820[i].baseaddr = mmap[i].baseaddr;
-				e820[i].length = mmap[i].length;
-				e820[i].type = mmap[i].type;
-
-				dev_dbg(ACRN_DBG_E820, "mmap table: %d type: 0x%x\n", i, mmap[i].type);
-				dev_dbg(ACRN_DBG_E820, "Base: 0x%016llx length: 0x%016llx",
-					mmap[i].baseaddr, mmap[i].length);
+	for (i = 0U; i < hv_e820_entries_nr; i++) {
+		if (mmap[i].baseaddr >= top_addr_space) {
+			mmap[i].length = 0UL;
+		} else {
+			if ((mmap[i].baseaddr + mmap[i].length) > top_addr_space) {
+				mmap[i].length = top_addr_space - mmap[i].baseaddr;
 			}
 		}
 
-		obtain_e820_mem_info();
-	} else {
-		panic("no multiboot info found");
+		hv_e820[i].baseaddr = mmap[i].baseaddr;
+		hv_e820[i].length = mmap[i].length;
+		hv_e820[i].type = mmap[i].type;
+
+		dev_dbg(DBG_LEVEL_E820, "mmap table: %d type: 0x%x", i, mmap[i].type);
+		dev_dbg(DBG_LEVEL_E820, "Base: 0x%016lx length: 0x%016lx\n",
+			mmap[i].baseaddr, mmap[i].length);
 	}
+
+	obtain_mem_range_info();
 }
 
 uint32_t get_e820_entries_count(void)
 {
-	return e820_entries_count;
+	return hv_e820_entries_nr;
 }
 
 const struct e820_entry *get_e820_entry(void)
 {
-	return e820;
+	return hv_e820;
 }
 
-const struct e820_mem_params *get_e820_mem_info(void)
+const struct mem_range *get_mem_range_info(void)
 {
-	return &e820_mem;
+	return &hv_mem_range;
 }
-
-#ifdef CONFIG_PARTITION_MODE
-uint32_t create_e820_table(struct e820_entry *param_e820)
-{
-	uint32_t i;
-
-	for (i = 0U; i < NUM_E820_ENTRIES; i++) {
-		param_e820[i].baseaddr = e820_default_entries[i].baseaddr;
-		param_e820[i].length = e820_default_entries[i].length;
-		param_e820[i].type = e820_default_entries[i].type;
-	}
-
-	return NUM_E820_ENTRIES;
-}
-#else
-uint32_t create_e820_table(struct e820_entry *param_e820)
-{
-	uint32_t i;
-
-	ASSERT(e820_entries_count > 0U, "e820 should be inited");
-
-	for (i = 0U; i < e820_entries_count; i++) {
-		param_e820[i].baseaddr = e820[i].baseaddr;
-		param_e820[i].length = e820[i].length;
-		param_e820[i].type = e820[i].type;
-	}
-
-	return e820_entries_count;
-}
-#endif

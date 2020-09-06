@@ -30,7 +30,7 @@ service (VBS) APIs, and virtqueue (VQ) APIs, as shown in
 -  **DM APIs** are exported by the DM, and are mainly used during the
    device initialization phase and runtime. The DM APIs also include
    PCIe emulation APIs because each virtio device is a PCIe device in
-   the SOS and UOS.
+   the Service VM and User VM.
 -  **VBS APIs** are mainly exported by the VBS and related modules.
    Generally they are callbacks to be
    registered into the DM.
@@ -111,7 +111,7 @@ Efficient: batching operation is encouraged
   high-performance I/O, since notification between FE and BE driver
   usually involves an expensive exit of the guest. Therefore batching
   operating and notification suppression are highly encouraged if
-  possible. This will give an efficient implementation for 
+  possible. This will give an efficient implementation for
   performance-critical devices.
 
 Standard: virtqueue
@@ -120,7 +120,7 @@ Standard: virtqueue
   queue of scatter-gather buffers. There are three important methods on
   virtqueues:
 
-  - **add_buf** is for adding a request/response buffer in a virtqueue, 
+  - **add_buf** is for adding a request/response buffer in a virtqueue,
   - **get_buf** is for getting a response/request in a virtqueue, and
   - **kick** is for notifying the other side for a virtqueue to consume buffers.
 
@@ -275,7 +275,7 @@ The architecture of ACRN VBS-K is shown in
 :numref:`kernel-virtio-framework` below.
 
 Generally VBS-K provides acceleration towards performance critical
-devices emulated by VBS-U modules by handling the “data plane” of the
+devices emulated by VBS-U modules by handling the "data plane" of the
 devices directly in the kernel. When VBS-K is enabled for certain
 devices, the kernel-land vring service API helpers, instead of the
 user-land helpers, are used to access the virtqueues shared by the FE
@@ -366,7 +366,7 @@ The workflow can be summarized as:
    irqfd.
 2. pass ioeventfd to vhost kernel driver.
 3. pass ioevent fd to vhm driver
-4. UOS FE driver triggers ioreq and forwarded to SOS by hypervisor
+4. User VM FE driver triggers ioreq and forwarded to Service VM by hypervisor
 5. ioreq is dispatched by vhm driver to related vhm client.
 6. ioeventfd vhm client traverse the io_range list and find
    corresponding eventfd.
@@ -396,7 +396,9 @@ The workflow can be summarized as:
 5. irqfd related logic traverses the irqfd list to retrieve related irq
    information.
 6. irqfd related logic inject an interrupt through vhm interrupt API.
-7. interrupt is delivered to UOS FE driver through hypervisor.
+7. interrupt is delivered to User VM FE driver through hypervisor.
+
+.. _virtio-APIs:
 
 Virtio APIs
 ***********
@@ -540,7 +542,7 @@ VBS APIs
 ========
 
 The VBS APIs are exported by VBS related modules, including VBS, DM, and
-SOS kernel modules. They can be classified into VBS-U and VBS-K APIs
+Service VM kernel modules. They can be classified into VBS-U and VBS-K APIs
 listed as follows.
 
 VBS-U APIs
@@ -558,9 +560,6 @@ the virtio framework within DM will invoke them appropriately.
 .. doxygenfunction:: virtio_pci_write
    :project: Project ACRN
 
-.. doxygenfunction:: virtio_dev_error
-   :project: Project ACRN
-
 .. doxygenfunction:: virtio_interrupt_init
    :project: Project ACRN
 
@@ -574,12 +573,6 @@ the virtio framework within DM will invoke them appropriately.
    :project: Project ACRN
 
 .. doxygenfunction:: virtio_set_modern_bar
-   :project: Project ACRN
-
-.. doxygenfunction:: virtio_pci_modern_cfgread
-   :project: Project ACRN
-
-.. doxygenfunction:: virtio_pci_modern_cfgwrite
    :project: Project ACRN
 
 .. doxygenfunction:: virtio_config_changed
@@ -758,6 +751,10 @@ their temporary IDs are listed in the following table.
    +--------------+-------------+-------------+-------------+-------------+
    | COREU        | 0x8086      | 0x8608      | 0x8086      | 0xFFF8      |
    +--------------+-------------+-------------+-------------+-------------+
+   | I2C          | 0x8086      | 0x860a      | 0x8086      | 0xFFF6      |
+   +--------------+-------------+-------------+-------------+-------------+
+   | GPIO         | 0x8086      | 0x8609      | 0x8086      | 0xFFF7      |
+   +--------------+-------------+-------------+-------------+-------------+
 
 The following sections introduce the status of virtio devices currently
 supported in ACRN.
@@ -770,3 +767,5 @@ supported in ACRN.
    virtio-input
    virtio-console
    virtio-rnd
+   virtio-i2c
+   virtio-gpio

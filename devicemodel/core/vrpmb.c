@@ -28,11 +28,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
 #include <openssl/rand.h>
 
 #include "types.h"
 #include "vrpmb.h"
+#include "log.h"
 
 #define DRNG_MAX_RETRIES 5U
 
@@ -52,11 +52,14 @@ int get_vrpmb_key(uint8_t *out, size_t size)
 	int i;
 
 	if (!out) {
-		fprintf(stderr, "%s: Invalid output pointer\n", __func__);
+		pr_err("%s: Invalid output pointer\n", __func__);
 		return 0;
 	}
 
-	assert(size == RPMB_KEY_LEN);
+	if (size != RPMB_KEY_LEN) {
+		pr_err("%s: Invalid input key size\n", __func__);
+		return 0;
+	}
 
 	if ( vrkey.initialized == false ) {
 		for (i = 0; i < DRNG_MAX_RETRIES; i++) {
@@ -68,7 +71,7 @@ int get_vrpmb_key(uint8_t *out, size_t size)
 		}
 
 		if (vrkey.initialized != true) {
-			fprintf(stderr, "%s: unable to generate random key!\n", __func__);
+			pr_err("%s: unable to generate random key!\n", __func__);
 			return 0;
 		}
 	}

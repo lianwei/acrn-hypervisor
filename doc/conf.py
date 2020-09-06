@@ -35,8 +35,11 @@ if "RELEASE" in os.environ:
 # ones.
 
 sys.path.insert(0, os.path.join(os.path.abspath('.'), 'extensions'))
-extensions = ['breathe', 'sphinx.ext.graphviz', 'sphinx.ext.extlinks',
-              'kerneldoc', 'eager_only']
+extensions = [
+   'breathe', 'sphinx.ext.graphviz', 'sphinx.ext.extlinks',
+   'kerneldoc', 'eager_only', 'html_redirects',
+   'sphinx_tabs.tabs'
+]
 
 # extlinks provides a macro template
 
@@ -72,7 +75,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'Project ACRN™'
-copyright = u'2019, Project ACRN'
+copyright = u'2020, Project ACRN'
 author = u'Project ARCN developers'
 
 # The version info for the project you're documenting, acts as replacement for
@@ -81,15 +84,16 @@ author = u'Project ARCN developers'
 
 # The following code tries to extract the information by reading the
 # Makefile from the acrn-hypervisor repo by finding these lines:
-#   MAJOR_VERSION=0
-#   MINOR_VERSION=1
-#   RC_VERSION=1
+#   MAJOR_VERSION=1
+#   MINOR_VERSION=3
+#   EXTRA_VERSION=-unstable
 
 try:
     version_major = None
     version_minor = None
     version_rc = None
-    for line in open(os.path.normpath("../VERSION")) :
+
+    for line in open(os.path.realpath("../../../VERSION")) :
         # remove comments
         line = line.split('#', 1)[0]
         line = line.rstrip()
@@ -103,18 +107,14 @@ try:
               version_rc = val
            if version_major and version_minor and version_rc :
               break
-except:
-    pass
 finally:
     if version_major and version_minor :
-        version = release = "v " + version_major + '.' + version_minor
+        version = release = "v " + str(version_major) + '.' + str(version_minor)
         if version_rc :
           version = release = version + version_rc
     else:
         sys.stderr.write('Warning: Could not extract hypervisor version from VERSION file\n')
         version = release = "unknown"
-
-
 
 #
 # The short X.Y version.
@@ -132,7 +132,7 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This patterns also effect to html_static_path and html_extra_path
-exclude_patterns = ['_build' ]
+exclude_patterns = ['_build', 'misc/README.rst' ]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
@@ -189,11 +189,13 @@ else:
 html_context = {
    'current_version': current_version,
    'versions': ( ("latest", "/latest/"),
-                 ("0.5", "/0.5/"),
-                 ("0.4", "/0.4/"),
-                 ("0.3", "/0.3/"),
-                 ("0.2", "/0.2/"),
-                 ("0.1", "/0.1/"),
+                 ("2.1", "/2.1/"),
+                 ("2.0", "/2.0/"),
+                 ("1.6.1", "/1.6.1/"),
+                 ("1.6", "/1.6/"),
+                 ("1.5", "/1.5/"),
+                 ("1.4", "/1.4/"),
+                 ("1.0", "/1.0/"),   # keep 1.0
                )
     }
 
@@ -218,6 +220,8 @@ html_static_path = ['static']
 
 def setup(app):
    app.add_stylesheet("acrn-custom.css")
+   app.add_javascript("https://www.googletagmanager.com/gtag/js?id=UA-831873-64")
+   # note more GA tag manager calls are in acrn-custom.js
    app.add_javascript("acrn-custom.js")
 
 # Custom sidebar templates, must be a dictionary that maps document names
@@ -234,6 +238,10 @@ html_show_sourcelink = False
 # bottom,
 # using the given strftime format.
 html_last_updated_fmt = '%b %d, %Y'
+
+# The name of a javascript file (relative to the configuration directory) that
+# implements a search results scorer. If empty, the default will be used.
+html_search_scorer = 'scorer.js'
 
 # -- Options for HTMLHelp output ------------------------------------------
 
@@ -302,3 +310,20 @@ breathe_projects = {
 }
 breathe_default_project = "Project ACRN"
 breathe_default_members = ('members', 'undoc-members', 'content-only')
+
+
+# Custom added feature to allow redirecting old URLs (caused by
+# reorganizing doc directories)
+#
+# list of tuples (old_url, new_url) for pages to redirect
+#
+# URLs must be relative to document root (with NO leading slash),
+# and without the html extension)
+html_redirect_pages = [
+   ('developer-guides/index', 'contribute'),
+   ('getting-started/index', 'try'),
+   ('user-guides/index', 'develop'),
+   ('hardware', 'reference/hardware'),
+   ('release_notes', 'release_notes/index'),
+   ('getting-started/rt_industry', 'tutorials/cl_servicevm')
+   ]

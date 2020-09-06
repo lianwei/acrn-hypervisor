@@ -502,17 +502,14 @@ vmei_del_me_client(struct vmei_me_client *mclient)
 static void
 vmei_me_client_destroy_host_clients(struct vmei_me_client *mclient)
 {
-	struct vmei_host_client *e, *n;
+	struct vmei_host_client *e, *temp;
 
 	pthread_mutex_lock(&mclient->list_mutex);
-	e = LIST_FIRST(&mclient->connections);
-	while (e) {
-		n = LIST_NEXT(e, list);
+	list_foreach_safe(e, &mclient->connections, list, temp) {
 		vmei_host_client_put(e);
-		e = n;
 	}
-	pthread_mutex_unlock(&mclient->list_mutex);
 	LIST_INIT(&mclient->connections);
+	pthread_mutex_unlock(&mclient->list_mutex);
 }
 
 static void
@@ -546,6 +543,7 @@ vmei_me_client_create(struct virtio_mei *vmei, uint8_t client_id,
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
 	pthread_mutex_init(&mclient->list_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
+	LIST_INIT(&mclient->connections);
 
 	mclient->vmei = vmei;
 	mclient->client_id = client_id;
@@ -645,14 +643,11 @@ vmei_find_host_client(struct virtio_mei *vmei,
 
 static void vmei_free_me_clients(struct virtio_mei *vmei)
 {
-	struct vmei_me_client *e, *n;
+	struct vmei_me_client *e, *temp;
 
 	pthread_mutex_lock(&vmei->list_mutex);
-	e = LIST_FIRST(&vmei->active_clients);
-	while (e) {
-		n = LIST_NEXT(e, list);
+	list_foreach_safe(e, &vmei->active_clients, list, temp) {
 		vmei_me_client_put(e);
-		e = n;
 	}
 	LIST_INIT(&vmei->active_clients);
 	pthread_mutex_unlock(&vmei->list_mutex);
@@ -942,7 +937,7 @@ static void
 vmei_virtual_fw_reset(struct virtio_mei *vmei)
 {
 	DPRINTF("Firmware reset\n");
-	struct vmei_me_client *e;
+	struct vmei_me_client *e, *temp;
 
 	vmei_set_status(vmei, VMEI_STS_RESET);
 	vmei->config->hw_ready = 0;
@@ -953,7 +948,7 @@ vmei_virtual_fw_reset(struct virtio_mei *vmei)
 
 	/* disconnect all */
 	pthread_mutex_lock(&vmei->list_mutex);
-	LIST_FOREACH(e, &vmei->active_clients, list) {
+	list_foreach_safe(e, &vmei->active_clients, list, temp) {
 		vmei_me_client_destroy_host_clients(e);
 	}
 	pthread_mutex_unlock(&vmei->list_mutex);
@@ -1495,7 +1490,15 @@ vmei_proc_tx(struct virtio_mei *vmei, struct virtio_vq_info *vq)
 	 * The first one is hdr, the second is for payload.
 	 */
 	n = vq_getchain(vq, &idx, iov, VMEI_TX_SEGS, NULL);
-	assert(n == 2);
+	if (n != VMEI_TX_SEGS) {
+		if (n == -1 || n == 0)
+			pr_err("%s: fail to getchain!\n", __func__);
+		else {
+			pr_warn("%s: invalid chain, desc number %d!\n", __func__, n);
+			vq_relchain(vq, idx, 0);
+		}
+		return;
+	}
 
 	hdr = (struct mei_msg_hdr *)iov[0].iov_base;
 	data = (uint8_t *)iov[1].iov_base;
@@ -1561,11 +1564,10 @@ out:
 	vq_relchain(vq, idx, tlen);
 	DPRINTF("TX: release OUT-vq idx[%d]\n", idx);
 
-	if (vmei->rx_need_sched) {
-		pthread_mutex_lock(&vmei->rx_mutex);
+	pthread_mutex_lock(&vmei->rx_mutex);
+	if (vmei->rx_need_sched)
 		pthread_cond_signal(&vmei->rx_cond);
-		pthread_mutex_unlock(&vmei->rx_mutex);
-	}
+	pthread_mutex_unlock(&vmei->rx_mutex);
 
 	return;
 
@@ -1595,8 +1597,9 @@ vmei_notify_tx(void *data, struct virtio_vq_info *vq)
 	vq->used->flags |= VRING_USED_F_NO_NOTIFY;
 	pthread_mutex_unlock(&vmei->tx_mutex);
 
-	while (vq_has_descs(vq))
+	do {
 		vmei_proc_tx(vmei, vq);
+	} while (vq_has_descs(vq));
 
 	vq_endchains(vq, 1);
 
@@ -1621,20 +1624,32 @@ static void *vmei_tx_thread(void *param)
 {
 	struct virtio_mei *vmei = param;
 	struct timespec max_wait = {0, 0};
-	int err;
+	int err, pending_cnt = 0;
 
 	pthread_mutex_lock(&vmei->tx_mutex);
-	err = pthread_cond_wait(&vmei->tx_cond, &vmei->tx_mutex);
-	assert(err == 0);
-	if (err)
-		goto out;
 
 	while (vmei->status != VMEI_STST_DEINIT) {
 		struct vmei_me_client *me;
 		struct vmei_host_client *e;
 		ssize_t len;
-		int pending_cnt = 0;
-		int send_ready  = 0;
+		int send_ready;
+
+		if (pending_cnt == 0) {
+			err = pthread_cond_wait(&vmei->tx_cond,
+						&vmei->tx_mutex);
+			if (err)
+				goto out;
+		} else {
+			max_wait.tv_sec = time(NULL) + 2;
+			max_wait.tv_nsec = 0;
+			err = pthread_cond_timedwait(&vmei->tx_cond,
+						     &vmei->tx_mutex,
+						     &max_wait);
+			if (err && err != ETIMEDOUT)
+				goto out;
+
+			pending_cnt = 0;
+		}
 
 		pthread_mutex_lock(&vmei->list_mutex);
 		LIST_FOREACH(me, &vmei->active_clients, list) {
@@ -1664,21 +1679,8 @@ static void *vmei_tx_thread(void *param)
 		}
 unlock:
 		pthread_mutex_unlock(&vmei->list_mutex);
-
-		if (pending_cnt == 0) {
-			err = pthread_cond_wait(&vmei->tx_cond,
-						&vmei->tx_mutex);
-		} else {
-			max_wait.tv_sec = time(NULL) + 2;
-			max_wait.tv_nsec = 0;
-			err = pthread_cond_timedwait(&vmei->tx_cond,
-						     &vmei->tx_mutex,
-						     &max_wait);
-		}
-
-		if (vmei->status == VMEI_STST_DEINIT)
-			goto out;
 	}
+
 out:
 	pthread_mutex_unlock(&vmei->tx_mutex);
 	pthread_exit(NULL);
@@ -1781,9 +1783,15 @@ vmei_proc_vclient_rx(struct vmei_host_client *hclient,
 	bool complete = true;
 
 	n = vq_getchain(vq, &idx, iov, VMEI_RX_SEGS, NULL);
-	assert(n == VMEI_RX_SEGS);
-	if (n != VMEI_RX_SEGS)
+	if (n != VMEI_RX_SEGS) {
+		if (n == -1)
+			pr_err("%s: fail to getchain!\n", __func__);
+		else {
+			pr_warn("%s: invalid chain, desc number %d!\n", __func__, n);
+			vq_relchain(vq, idx, 0);
+		}
 		return;
+	}
 
 	len = hclient->recv_offset - hclient->recv_handled;
 	HCL_DBG(hclient, "RX: DM->UOS: off=%d len=%d\n",
@@ -1873,50 +1881,50 @@ found:
 /*
  * Thread which will handle processing of RX desc
  */
-
 static void *vmei_rx_thread(void *param)
 {
 	struct virtio_mei *vmei = param;
-	struct virtio_vq_info *vq;
+	struct virtio_vq_info *vq = &vmei->vqs[VMEI_RXQ];
 	int err;
-
-	vq = &vmei->vqs[VMEI_RXQ];
 
 	/*
 	 * Let us wait till the rx queue pointers get initialised &
 	 * first tx signaled
 	 */
 	pthread_mutex_lock(&vmei->rx_mutex);
-	err = pthread_cond_wait(&vmei->rx_cond, &vmei->rx_mutex);
-	assert(err == 0);
-	if (err)
-		goto out;
+
+	while (vmei->status != VMEI_STST_DEINIT && !vq_ring_ready(vq)) {
+		err = pthread_cond_wait(&vmei->rx_cond, &vmei->rx_mutex);
+		if (err)
+			goto out;
+	}
 
 	while (vmei->status != VMEI_STST_DEINIT) {
 		/* note - rx mutex is locked here */
-		while (vq_ring_ready(vq)) {
+		while (!vmei->rx_need_sched || !vq_has_descs(vq)) {
 			vq_clear_used_ring_flags(&vmei->base, vq);
 			mb();
-			if (vq_has_descs(vq) &&
-			    vmei->rx_need_sched &&
-			    vmei->status != VMEI_STS_RESET)
+			if (vmei->rx_need_sched &&
+			    vmei->status != VMEI_STS_RESET &&
+			    vq_has_descs(vq))
 				break;
 
 			err = pthread_cond_wait(&vmei->rx_cond,
 						&vmei->rx_mutex);
-			assert(err == 0);
 			if (err || vmei->status == VMEI_STST_DEINIT)
 				goto out;
 		}
+
 		vq->used->flags |= VRING_USED_F_NO_NOTIFY;
 
 		do {
 			vmei->rx_need_sched = vmei_proc_rx(vmei, vq);
-		} while (vq_has_descs(vq) && vmei->rx_need_sched);
+		} while (vmei->rx_need_sched && vq_has_descs(vq));
 
-		if (!vq_has_descs(vq))
-			vq_endchains(vq, 1);
+		/* at least one avail ring element has been processed */
+		vq_endchains(vq, !vq_has_descs(vq));
 	}
+
 out:
 	pthread_mutex_unlock(&vmei->rx_mutex);
 	pthread_exit(NULL);
@@ -2301,6 +2309,15 @@ init:
 	virtio_set_io_bar(&vmei->base, 0);
 
 	/*
+	 * init clients
+	 */
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&vmei->list_mutex, &attr);
+	pthread_mutexattr_destroy(&attr);
+	LIST_INIT(&vmei->active_clients);
+
+	/*
 	 * tx stuff, thread, mutex, cond
 	 */
 	pthread_mutex_init(&vmei->tx_mutex, NULL);
@@ -2319,15 +2336,6 @@ init:
 		       vmei_rx_thread, (void *)vmei);
 	snprintf(tname, sizeof(tname), "vmei-%d:%d rx", dev->slot, dev->func);
 	pthread_setname_np(vmei->rx_thread, tname);
-
-	/*
-	 * init clients
-	 */
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-	pthread_mutex_init(&vmei->list_mutex, &attr);
-	pthread_mutexattr_destroy(&attr);
-	LIST_INIT(&vmei->active_clients);
 
 	/*
 	 * start mei backend

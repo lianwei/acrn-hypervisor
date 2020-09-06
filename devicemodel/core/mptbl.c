@@ -275,13 +275,6 @@ mpt_build_ioint_entries(int_entry_ptr mpie, int id)
 		pci_walk_lintr(bus, mpt_generate_pci_int, &mpie);
 }
 
-void
-mptable_add_oemtbl(void *tbl, int tblsz)
-{
-	oem_tbl_start = tbl;
-	oem_tbl_size = tblsz;
-}
-
 int
 mptable_build(struct vmctx *ctx, int ncpu)
 {
@@ -297,7 +290,7 @@ mptable_build(struct vmctx *ctx, int ncpu)
 
 	startaddr = paddr_guest2host(ctx, MPTABLE_BASE, MPTABLE_MAX_LENGTH);
 	if (startaddr == NULL) {
-		fprintf(stderr, "mptable requires mapped mem\n");
+		pr_err("mptable requires mapped mem\n");
 		return -1;
 	}
 
@@ -308,9 +301,9 @@ mptable_build(struct vmctx *ctx, int ncpu)
 	 */
 	for (bus = 1; bus <= PCI_BUSMAX; bus++) {
 		if (pci_bus_configured(bus)) {
-			fprintf(stderr, "MPtable is incompatible with "
+			pr_err("MPtable is incompatible with "
 			    "multiple PCI hierarchies.\r\n");
-			fprintf(stderr, "MPtable generation can be disabled "
+			pr_err("MPtable generation can be disabled "
 			    "by passing the -Y option to acrn-dm.\r\n");
 			return -1;
 		}
@@ -335,16 +328,19 @@ mptable_build(struct vmctx *ctx, int ncpu)
 	curraddr += sizeof(*mpeb) * MPE_NUM_BUSES;
 	mpch->entry_count += MPE_NUM_BUSES;
 
-	mpei = (io_apic_entry_ptr)curraddr;
-	mpt_build_ioapic_entries(mpei, 0);
-	curraddr += sizeof(*mpei);
-	mpch->entry_count++;
+	/* Don't generate io_apic entry for VM with lapic pt */
+	if (!lapic_pt) {
+		mpei = (io_apic_entry_ptr)curraddr;
+		mpt_build_ioapic_entries(mpei, 0);
+		curraddr += sizeof(*mpei);
+		mpch->entry_count++;
 
-	mpie = (int_entry_ptr) curraddr;
-	ioints = mpt_count_ioint_entries();
-	mpt_build_ioint_entries(mpie, 0);
-	curraddr += sizeof(*mpie) * ioints;
-	mpch->entry_count += ioints;
+		mpie = (int_entry_ptr) curraddr;
+		ioints = mpt_count_ioint_entries();
+		mpt_build_ioint_entries(mpie, 0);
+		curraddr += sizeof(*mpie) * ioints;
+		mpch->entry_count += ioints;
+	}
 
 	mpie = (int_entry_ptr)curraddr;
 	mpt_build_localint_entries(mpie);

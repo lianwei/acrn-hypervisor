@@ -4,7 +4,7 @@ Virtio-net
 ##########
 
 Virtio-net is the para-virtualization solution used in ACRN for
-networking. The ACRN device model emulates virtual NICs for UOS and the
+networking. The ACRN device model emulates virtual NICs for User VM and the
 frontend virtio network driver, simulating the virtual NIC and following
 the virtio specification. (Refer to :ref:`introduction` and
 :ref:`virtio-hld` background introductions to ACRN and Virtio.)
@@ -23,7 +23,7 @@ Network Virtualization Architecture
 
 ACRN's network virtualization architecture is shown below in
 :numref:`net-virt-arch`, and illustrates the many necessary network
-virtualization components that must cooperate for the UOS to send and
+virtualization components that must cooperate for the User VM to send and
 receive data from the outside world.
 
 .. figure:: images/network-virt-arch.png
@@ -38,7 +38,7 @@ components are parts of the Linux kernel.)
 
 Let's explore these components further.
 
-SOS/UOS Network Stack:
+Service VM/User VM Network Stack:
    This is the standard Linux TCP/IP stack, currently the most
    feature-rich TCP/IP implementation.
 
@@ -57,11 +57,11 @@ ACRN Hypervisor:
    bare-metal hardware, and suitable for a variety of IoT and embedded
    device solutions. It fetches and analyzes the guest instructions, puts
    the decoded information into the shared page as an IOREQ, and notifies
-   or interrupts the VHM module in the SOS for processing.
+   or interrupts the VHM module in the Service VM for processing.
 
 VHM Module:
    The Virtio and Hypervisor Service Module (VHM) is a kernel module in the
-   Service OS (SOS) acting as a middle layer to support the device model
+   Service VM acting as a middle layer to support the device model
    and hypervisor. The VHM forwards a IOREQ to the virtio-net backend
    driver for processing.
 
@@ -70,9 +70,9 @@ ACRN Device Model and virtio-net Backend Driver:
    the virtio-net backend driver to process the request. The backend driver
    receives the data in a shared virtqueue and sends it to the TAP device.
 
-Bridge and Tap Device:
-   Bridge and Tap are standard virtual network infrastructures. They play
-   an important role in communication among the SOS, the UOS, and the
+Bridge and TAP Device:
+   Bridge and TAP are standard virtual network infrastructures. They play
+   an important role in communication among the Service VM, the User VM, and the
    outside world.
 
 IGB Driver:
@@ -82,7 +82,7 @@ IGB Driver:
 
 The virtual network card (NIC) is implemented as a virtio legacy device
 in the ACRN device model (DM). It is registered as a PCI virtio device
-to the guest OS (UOS) and uses the standard virtio-net in the Linux kernel as
+to the guest OS (User VM) and uses the standard virtio-net in the Linux kernel as
 its driver (the guest kernel should be built with
 ``CONFIG_VIRTIO_NET=y``).
 
@@ -96,7 +96,7 @@ ACRN Virtio-Network Calling Stack
 
 Various components of ACRN network virtualization are shown in the
 architecture diagram shows in :numref:`net-virt-arch`.  In this section,
-we will use UOS data transmission (TX) and reception (RX) examples to
+we will use User VM data transmission (TX) and reception (RX) examples to
 explain step-by-step how these components work together to implement
 ACRN network virtualization.
 
@@ -108,7 +108,7 @@ Initialization in Device Model
 - Present frontend for a virtual PCI based NIC
 - Setup control plan callbacks
 - Setup data plan callbacks, including TX, RX
-- Setup tap backend
+- Setup TAP backend
 
 Initialization in virtio-net Frontend Driver
 ============================================
@@ -123,13 +123,13 @@ Initialization in virtio-net Frontend Driver
 - Register network driver
 - Setup shared virtqueues
 
-ACRN UOS TX FLOW
-================
+ACRN User VM TX FLOW
+====================
 
-The following shows the ACRN UOS network TX flow, using TCP as an
+The following shows the ACRN User VM network TX flow, using TCP as an
 example, showing the flow through each layer:
 
-**UOS TCP Layer**
+**User VM TCP Layer**
 
 .. code-block:: c
 
@@ -139,7 +139,7 @@ example, showing the flow through each layer:
                tcp_write_xmit -->
                    tcp_transmit_skb -->
 
-**UOS IP Layer**
+**User VM IP Layer**
 
 .. code-block:: c
 
@@ -153,7 +153,7 @@ example, showing the flow through each layer:
                                neigh_output -->
                                    neigh_resolve_output -->
 
-**UOS MAC Layer**
+**User VM MAC Layer**
 
 .. code-block:: c
 
@@ -165,7 +165,7 @@ example, showing the flow through each layer:
                        __netdev_start_xmit -->
 
 
-**UOS MAC Layer virtio-net Frontend Driver**
+**User VM MAC Layer virtio-net Frontend Driver**
 
 .. code-block:: c
 
@@ -187,7 +187,7 @@ example, showing the flow through each layer:
        pio_instr_vmexit_handler -->
            emulate_io -->                  // ioreq cant be processed in HV, forward it to VHM
                acrn_insert_request_wait -->
-                   fire_vhm_interrupt -->  // interrupt SOS, VHM will get notified
+                   fire_vhm_interrupt -->  // interrupt Service VM, VHM will get notified
 
 **VHM Module**
 
@@ -216,7 +216,7 @@ example, showing the flow through each layer:
                                        virtio_net_tap_tx -->
                                            writev -->    // write data to tap device
 
-**SOS TAP Device Forwarding**
+**Service VM TAP Device Forwarding**
 
 .. code-block:: c
 
@@ -233,7 +233,7 @@ example, showing the flow through each layer:
                                            __netif_receive_skb_core -->
 
 
-**SOS Bridge Forwarding**
+**Service VM Bridge Forwarding**
 
 .. code-block:: c
 
@@ -244,7 +244,7 @@ example, showing the flow through each layer:
                    br_forward_finish -->
                        br_dev_queue_push_xmit -->
 
-**SOS MAC Layer**
+**Service VM MAC Layer**
 
 .. code-block:: c
 
@@ -256,16 +256,16 @@ example, showing the flow through each layer:
                        __netdev_start_xmit -->
 
 
-**SOS MAC Layer IGB Driver**
+**Service VM MAC Layer IGB Driver**
 
 .. code-block:: c
 
    igb_xmit_frame --> // IGB physical NIC driver xmit function
 
-ACRN UOS RX FLOW
-================
+ACRN User VM RX FLOW
+====================
 
-The following shows the ACRN UOS network RX flow, using TCP as an example.
+The following shows the ACRN User VM network RX flow, using TCP as an example.
 Let's start by receiving a device interrupt. (Note that the hypervisor
 will first get notified when receiving an interrupt even in passthrough
 cases.)
@@ -288,11 +288,11 @@ cases.)
 
    do_softirq -->
        ptdev_softirq -->
-           vlapic_intr_msi -->     // insert the interrupt into SOS
+           vlapic_intr_msi -->     // insert the interrupt into Service VM
 
    start_vcpu -->                  // VM Entry here, will process the pending interrupts
 
-**SOS MAC Layer IGB Driver**
+**Service VM MAC Layer IGB Driver**
 
 .. code-block:: c
 
@@ -306,7 +306,7 @@ cases.)
                            __netif_receive_skb -->
                                __netif_receive_skb_core --
 
-**SOS Bridge Forwarding**
+**Service VM Bridge Forwarding**
 
 .. code-block:: c
 
@@ -317,7 +317,7 @@ cases.)
                    br_forward_finish -->
                        br_dev_queue_push_xmit -->
 
-**SOS MAC Layer**
+**Service VM MAC Layer**
 
 .. code-block:: c
 
@@ -328,7 +328,7 @@ cases.)
                    netdev_start_xmit -->
                        __netdev_start_xmit -->
 
-**SOS MAC Layer TAP Driver**
+**Service VM MAC Layer TAP Driver**
 
 .. code-block:: c
 
@@ -339,7 +339,7 @@ cases.)
 .. code-block:: c
 
    virtio_net_rx_callback -->       // the tap fd get notified and this function invoked
-       virtio_net_tap_rx -->        // read data from tap, prepare virtqueue, insert interrupt into the UOS
+       virtio_net_tap_rx -->        // read data from tap, prepare virtqueue, insert interrupt into the User VM
            vq_endchains -->
                vq_interrupt -->
                    pci_generate_msi -->
@@ -357,22 +357,22 @@ cases.)
 
    vmexit_handler -->               // vmexit because VMX_EXIT_REASON_VMCALL
        vmcall_vmexit_handler -->
-           hcall_inject_msi -->     // insert interrupt into UOS
+           hcall_inject_msi -->     // insert interrupt into User VM
                vlapic_intr_msi -->
 
-**UOS MAC Layer virtio_net Frontend Driver**
+**User VM MAC Layer virtio_net Frontend Driver**
 
 .. code-block:: c
 
    vring_interrupt -->              // virtio-net frontend driver interrupt handler
-       skb_recv_done -->            //registed by virtnet_probe-->init_vqs-->virtnet_find_vqs
+       skb_recv_done -->            // registered by virtnet_probe-->init_vqs-->virtnet_find_vqs
            virtqueue_napi_schedule -->
                __napi_schedule -->
                    virtnet_poll -->
                        virtnet_receive -->
                            receive_buf -->
 
-**UOS MAC Layer**
+**User VM MAC Layer**
 
 .. code-block:: c
 
@@ -382,7 +382,7 @@ cases.)
                __netif_receive_skb -->
                    __netif_receive_skb_core -->
 
-**UOS IP Layer**
+**User VM IP Layer**
 
 .. code-block:: c
 
@@ -393,7 +393,7 @@ cases.)
                    ip_local_deliver_finish -->
 
 
-**UOS TCP Layer**
+**User VM TCP Layer**
 
 .. code-block:: c
 
@@ -406,32 +406,32 @@ cases.)
 
                    sk->sk_data_ready --> // application will get notified
 
-How to Use
-==========
+How to Use TAP Interface
+========================
 
 The network infrastructure shown in :numref:`net-virt-infra` needs to be
-prepared in the SOS before we start. We need to create a bridge and at
-least one tap device (two tap devices are needed to create a dual
-virtual NIC) and attach a physical NIC and tap device to the bridge.
+prepared in the Service VM before we start. We need to create a bridge and at
+least one TAP device (two TAP devices are needed to create a dual
+virtual NIC) and attach a physical NIC and TAP device to the bridge.
 
 .. figure:: images/network-virt-sos-infrastruct.png
    :align: center
    :width: 900px
    :name: net-virt-infra
 
-   Network Infrastructure in SOS
+   Network Infrastructure in Service VM
 
 You can use Linux commands (e.g. ip, brctl) to create this network. In
 our case, we use systemd to automatically create the network by default.
-You can check the files with prefix 50- in the SOS
+You can check the files with prefix 50- in the Service VM
 ``/usr/lib/systemd/network/``:
 
-- `50-acrn.netdev <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/tools/acrnbridge/acrn.netdev>`__
-- `50-acrn.network <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/tools/acrnbridge/acrn.network>`__
-- `50-acrn_tap0.netdev <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/tools/acrnbridge/acrn_tap0.netdev>`__
-- `50-eth.network <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/tools/acrnbridge/eth.network>`__
+- `50-acrn.netdev <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/misc/acrnbridge/acrn.netdev>`__
+- `50-acrn.network <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/misc/acrnbridge/acrn.network>`__
+- `50-tap0.netdev <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/misc/acrnbridge/tap0.netdev>`__
+- `50-eth.network <https://raw.githubusercontent.com/projectacrn/acrn-hypervisor/master/misc/acrnbridge/eth.network>`__
 
-When the SOS is started, run ``ifconfig`` to show the devices created by
+When the Service VM is started, run ``ifconfig`` to show the devices created by
 this systemd configuration:
 
 .. code-block:: none
@@ -445,7 +445,7 @@ this systemd configuration:
       collisions:0 txqueuelen:1000
       RX bytes:100457754 (95.8 Mb) TX bytes:83481244 (79.6 Mb)
 
-   acrn_tap0 Link encap:Ethernet HWaddr F6:A7:7E:52:50:C6
+   tap0 Link encap:Ethernet HWaddr F6:A7:7E:52:50:C6
       UP BROADCAST MULTICAST MTU:1500 Metric:1
       RX packets:0 errors:0 dropped:0 overruns:0 frame:0
       TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
@@ -476,7 +476,7 @@ Run ``brctl show`` to see the bridge ``acrn-br0`` and attached devices:
 
    bridge name   bridge id STP       enabled   interfaces
 
-   acrn-br0      8000.b25041fef7a3   no        acrn_tap0
+   acrn-br0      8000.b25041fef7a3   no        tap0
                                                enp3s0
 
 Add a pci slot to the device model acrn-dm command line (mac address is
@@ -486,7 +486,7 @@ optional):
 
     -s 4,virtio-net,<tap_name>,[mac=<XX:XX:XX:XX:XX:XX>]
 
-When the UOS is launched, run ``ifconfig`` to check the network. enp0s4r
+When the User VM is launched, run ``ifconfig`` to check the network. enp0s4r
 is the virtual NIC created by acrn-dm:
 
 .. code-block:: none
@@ -508,6 +508,32 @@ is the virtual NIC created by acrn-dm:
       TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
       collisions:0 txqueuelen:1000
       RX bytes:0 (0.0 b) TX bytes:0 (0.0 b)
+
+How to Use MacVTap Interface
+============================
+In addition to TAP interface, ACRN also supports MacVTap interface.
+MacVTap replaces the combination of the TAP and bridge drivers with
+a single module based on MacVLan driver. With MacVTap, each
+virtual network interface is assigned its own MAC and IP address
+and is directly attached to the physical interface of the host machine
+to improve throughput and latencies.
+
+Create a MacVTap interface in the Service VM as shown here:
+
+.. code-block:: none
+
+   sudo ip link add link eth0 name macvtap0 type macvtap
+
+where ``eth0`` is the name of the physical network interface, and
+``macvtap0`` is the name of the MacVTap interface being created. (Make
+sure the MacVTap interface name includes the keyword ``tap``.)
+
+Once the MacVTap interface is created, the User VM can be launched by adding
+a PCI slot to the device model acrn-dm as shown below.
+
+.. code-block:: none
+
+   -s 4,virtio-net,<macvtap_name>,[mac=<XX:XX:XX:XX:XX:XX>]
 
 Performance Estimation
 ======================

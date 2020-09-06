@@ -70,20 +70,33 @@
 
 /* Intel-defined CPU features, CPUID level 0x00000007 (EBX)*/
 #define X86_FEATURE_TSC_ADJ	((FEAT_7_0_EBX << 5U) +  1U)
+#define X86_FEATURE_SGX		((FEAT_7_0_EBX << 5U) +  2U)
 #define X86_FEATURE_SMEP	((FEAT_7_0_EBX << 5U) +  7U)
 #define X86_FEATURE_ERMS	((FEAT_7_0_EBX << 5U) +  9U)
 #define X86_FEATURE_INVPCID	((FEAT_7_0_EBX << 5U) + 10U)
+#define X86_FEATURE_RDT_A	((FEAT_7_0_EBX << 5U) + 15U)
 #define X86_FEATURE_SMAP	((FEAT_7_0_EBX << 5U) + 20U)
+#define X86_FEATURE_CLFLUSHOPT	((FEAT_7_0_EBX << 5U) + 23U)
 
 /* Intel-defined CPU features, CPUID level 0x00000007 (EDX)*/
+#define X86_FEATURE_MDS_CLEAR	((FEAT_7_0_EDX << 5U) + 10U)
 #define X86_FEATURE_IBRS_IBPB	((FEAT_7_0_EDX << 5U) + 26U)
 #define X86_FEATURE_STIBP	((FEAT_7_0_EDX << 5U) + 27U)
 #define X86_FEATURE_L1D_FLUSH	((FEAT_7_0_EDX << 5U) + 28U)
 #define X86_FEATURE_ARCH_CAP	((FEAT_7_0_EDX << 5U) + 29U)
+#define X86_FEATURE_CORE_CAP	((FEAT_7_0_EDX << 5U) + 30U)
+#define X86_FEATURE_SSBD	((FEAT_7_0_EDX << 5U) + 31U)
 
 /* Intel-defined CPU features, CPUID level 0x80000001 (EDX)*/
 #define X86_FEATURE_NX		((FEAT_8000_0001_EDX << 5U) + 20U)
 #define X86_FEATURE_PAGE1GB	((FEAT_8000_0001_EDX << 5U) + 26U)
 #define X86_FEATURE_LM		((FEAT_8000_0001_EDX << 5U) + 29U)
+
+/* Intel-defined CPU features, CPUID level 0x80000007 (EDX)*/
+#define X86_FEATURE_INVA_TSC	((FEAT_8000_0007_EDX << 5U) + 8U)
+
+/* Intel-defined CPU features, CPUID level 0x0000000D, sub 0x1 */
+#define X86_FEATURE_COMPACTION_EXT	((FEAT_D_1_EAX << 5U) + 1U)
+#define X86_FEATURE_XSAVES		((FEAT_D_1_EAX << 5U) + 3U)
 
 #endif /* CPUFEATURES_H */

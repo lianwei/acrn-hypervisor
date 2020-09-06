@@ -9,12 +9,11 @@
  *
  */
 
-#include <hypervisor.h>
-
-static inline bool sbuf_is_empty(const struct shared_buf *sbuf)
-{
-	return (sbuf->head == sbuf->tail);
-}
+#include <types.h>
+#include <rtl.h>
+#include <errno.h>
+#include <cpu.h>
+#include <per_cpu.h>
 
 uint32_t sbuf_next_ptr(uint32_t pos_arg,
 		uint32_t span, uint32_t scope)
@@ -23,30 +22,6 @@ uint32_t sbuf_next_ptr(uint32_t pos_arg,
 	pos += span;
 	pos = (pos >= scope) ? (pos - scope) : pos;
 	return pos;
-}
-
-uint32_t sbuf_get(struct shared_buf *sbuf, uint8_t *data)
-{
-	const void *from;
-	uint32_t ele_size;
-
-	stac();
-	if (sbuf_is_empty(sbuf)) {
-		clac();
-		/* no data available */
-		return 0;
-	}
-
-	from = (void *)sbuf + SBUF_HEAD_SIZE + sbuf->head;
-
-	(void)memcpy_s((void *)data, sbuf->ele_size, from, sbuf->ele_size);
-
-	sbuf->head = sbuf_next_ptr(sbuf->head, sbuf->ele_size, sbuf->size);
-
-	ele_size = sbuf->ele_size;
-	clac();
-
-	return ele_size;
 }
 
 /**
@@ -110,9 +85,20 @@ int32_t sbuf_share_setup(uint16_t pcpu_id, uint32_t sbuf_id, uint64_t *hva)
 		return -EINVAL;
 	}
 
-	per_cpu(sbuf, pcpu_id)[sbuf_id] = hva;
+	per_cpu(sbuf, pcpu_id)[sbuf_id] = (struct shared_buf *) hva;
 	pr_info("%s share sbuf for pCPU[%u] with sbuf_id[%u] setup successfully",
 			__func__, pcpu_id, sbuf_id);
 
 	return 0;
+}
+
+void sbuf_reset(void)
+{
+	uint16_t pcpu_id, sbuf_id;
+
+	for (pcpu_id = 0U; pcpu_id < get_pcpu_nums(); pcpu_id++) {
+		for (sbuf_id = 0U; sbuf_id < ACRN_SBUF_ID_MAX; sbuf_id++) {
+			per_cpu(sbuf, pcpu_id)[sbuf_id] = 0U;
+		}
+	}
 }

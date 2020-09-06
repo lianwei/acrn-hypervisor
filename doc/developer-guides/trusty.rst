@@ -33,6 +33,8 @@ Trusty Architecture
 .. note::
    Trusty OS is running in Secure World in the architecture drawing above.
 
+.. _trusty-hypercalls:
+
 Trusty specific Hypercalls
 **************************
 
@@ -67,7 +69,7 @@ As shown in the above figure, here are some details about the Trusty boot flow p
    #. Resume to Secure World
 #. Trusty
 
-   a. Booting up
+   a. Booting
    #. Call ``hcall_world_switch`` to switch back to Normal World if boot completed
 #. ACRN (``hcall_world_switch``)
 
@@ -105,7 +107,7 @@ be updated.
 .. figure:: images/ept-hierarchy.png
    :align: center
    :width: 800px
-   :name: EPT hierarchy
+   :name: EPT hierarchy pic
 
 API
 ===

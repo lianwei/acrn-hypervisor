@@ -28,13 +28,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <assert.h>
 #include <stdbool.h>
 
 #include "dm.h"
 #include "vmmapi.h"
 #include "sw_load.h"
 #include "acpi.h"
+#include "log.h"
 
 
 /* If the vsbl is loaded by DM, the UOS memory layout will be like:
@@ -125,21 +125,19 @@ vsbl_set_bdf(int bnum, int snum, int fnum)
 int
 acrn_parse_guest_part_info(char *arg)
 {
-	int error;
+	int error = -1;
 	size_t len = strnlen(arg, STR_LEN);
 
 	if (len < STR_LEN) {
 		strncpy(guest_part_info_path, arg, len + 1);
-		error = check_image(guest_part_info_path, 0, &guest_part_info_size);
-		assert(!error);
-
-		with_guest_part_info = true;
-
-		printf("SW_LOAD: get partition blob path %s\n",
-			guest_part_info_path);
-		return 0;
-	} else
-		return -1;
+		if (check_image(guest_part_info_path, 0, &guest_part_info_size) == 0) {
+			with_guest_part_info = true;
+			pr_info("SW_LOAD: get partition blob path %s\n",
+						guest_part_info_path);
+			error = 0;
+		}
+	}
+	return error;
 }
 
 static int
@@ -194,21 +192,18 @@ acrn_prepare_guest_part_info(struct vmctx *ctx)
 int
 acrn_parse_vsbl(char *arg)
 {
-	int error;
+	int error = -1;
 	size_t len = strnlen(arg, STR_LEN);
 
 	if (len < STR_LEN) {
 		strncpy(vsbl_path, arg, len + 1);
-		error = check_image(vsbl_path, 8 * MB, &vsbl_size);
-		assert(!error);
-
-		vsbl_file_name = vsbl_path;
-
-		printf("SW_LOAD: get vsbl path %s\n",
-			vsbl_path);
-		return 0;
-	} else
-		return -1;
+		if (check_image(vsbl_path, 8 * MB, &vsbl_size) == 0) {
+			vsbl_file_name = vsbl_path;
+			printf("SW_LOAD: get vsbl path %s\n", vsbl_path);
+			error = 0;
+		}
+	}
+	return error;
 }
 
 static int
@@ -219,8 +214,7 @@ acrn_prepare_vsbl(struct vmctx *ctx)
 
 	fp = fopen(vsbl_path, "r");
 	if (fp == NULL) {
-		fprintf(stderr,
-			"SW_LOAD ERR: could not open vsbl file: %s\n",
+		pr_err("SW_LOAD ERR: could not open vsbl file: %s\n",
 			vsbl_path);
 		return -1;
 	}
@@ -228,8 +222,7 @@ acrn_prepare_vsbl(struct vmctx *ctx)
 	fseek(fp, 0, SEEK_END);
 
 	if (ftell(fp) != vsbl_size) {
-		fprintf(stderr,
-			"SW_LOAD ERR: vsbl file changed\n");
+		pr_err("SW_LOAD ERR: vsbl file changed\n");
 		fclose(fp);
 		return -1;
 	}
@@ -238,13 +231,12 @@ acrn_prepare_vsbl(struct vmctx *ctx)
 	read = fread(ctx->baseaddr + VSBL_TOP(ctx) - vsbl_size,
 		sizeof(char), vsbl_size, fp);
 	if (read < vsbl_size) {
-		fprintf(stderr,
-			"SW_LOAD ERR: could not read whole partition blob\n");
+		pr_err("SW_LOAD ERR: could not read whole partition blob\n");
 		fclose(fp);
 		return -1;
 	}
 	fclose(fp);
-	printf("SW_LOAD: partition blob %s size %lu copy to guest 0x%lx\n",
+	pr_info("SW_LOAD: partition blob %s size %lu copy to guest 0x%lx\n",
 		vsbl_path, vsbl_size, VSBL_TOP(ctx) - vsbl_size);
 
 	return 0;
@@ -301,7 +293,7 @@ acrn_sw_load_vsbl(struct vmctx *ctx)
 	vsbl_para->e820_entries = add_e820_entry(e820, vsbl_para->e820_entries,
 		vsbl_para->vsbl_address, vsbl_size, E820_TYPE_RESERVED);
 
-	printf("SW_LOAD: vsbl_entry 0x%lx\n", VSBL_TOP(ctx) - 16);
+	pr_info("SW_LOAD: vsbl_entry 0x%lx\n", VSBL_TOP(ctx) - 16);
 
 	vsbl_para->boot_device_address = boot_blk_bdf;
 	vsbl_para->trusty_enabled = trusty_enabled;

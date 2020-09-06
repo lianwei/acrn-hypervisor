@@ -55,7 +55,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <pthread.h>
 #include <sysexits.h>
 #include <dlfcn.h>
@@ -306,28 +305,43 @@ virtio_hdcp_talk_to_daemon(void *param)
 	for (;;) {
 		pthread_mutex_lock(&vhdcp->rx_mtx);
 		vhdcp->in_progress = 0;
-		ret = pthread_cond_wait(&vhdcp->rx_cond, &vhdcp->rx_mtx);
-		assert(ret == 0);
+
+		/*
+		 * Checking the avail ring here serves two purposes:
+		 *  - avoid vring processing due to spurious wakeups
+		 *  - catch missing notifications before acquiring rx_mtx
+		 */
+		while (!vq_has_descs(rvq))
+			pthread_cond_wait(&vhdcp->rx_cond, &vhdcp->rx_mtx);
 
 		vhdcp->in_progress = 1;
 		pthread_mutex_unlock(&vhdcp->rx_mtx);
 
-		while(vq_has_descs(rvq)) {
-			vq_getchain(rvq, &idx, &iov, 1, NULL);
+		do {
+			ret = vq_getchain(rvq, &idx, &iov, 1, NULL);
+			if (ret < 1) {
+				pr_err("%s: fail to getchain!\n", __func__);
+				return NULL;
+			}
+			if (ret > 1) {
+				pr_warn("%s: invalid chain!\n", __func__);
+				vq_relchain(rvq, idx, 0);
+				continue;
+			}
 
 			msg = (struct SocketData*)(iov.iov_base);
 
 			ret = performMessageTransaction(vhdcp->fd, *msg);
-			if (ret < 0)
-			{
+			if (ret < 0) {
 				close(vhdcp->fd);
 				vhdcp->fd = -1;
 			}
 
 			/* release this chain and handle more */
 			vq_relchain(rvq, idx, sizeof(struct SocketData));
-		}
+		} while (vq_has_descs(rvq));
 
+		/* at least one avail ring element has been processed */
 		vq_endchains(rvq, 1);
 	}
 }

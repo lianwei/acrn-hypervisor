@@ -6,6 +6,13 @@
 
 #ifndef VTD_H
 #define VTD_H
+#include <types.h>
+#include <pci.h>
+#include <platform_acpi_info.h>
+
+#define INVALID_DRHD_INDEX 0xFFFFFFFFU
+#define INVALID_IRTE_ID 0xFFFFU
+
 /*
  * Intel IOMMU register specification per version 1.0 public spec.
  */
@@ -34,6 +41,40 @@
 #define DMAR_IQA_REG    0x90U    /* Invalidation queue addr register */
 #define DMAR_ICS_REG    0x9cU    /* Invalidation complete status register */
 #define DMAR_IRTA_REG   0xb8U    /* Interrupt remapping table addr register */
+
+/* Values for entry_type in ACPI_DMAR_DEVICE_SCOPE - device types */
+enum acpi_dmar_scope_type {
+	ACPI_DMAR_SCOPE_TYPE_NOT_USED       = 0,
+	ACPI_DMAR_SCOPE_TYPE_ENDPOINT       = 1,
+	ACPI_DMAR_SCOPE_TYPE_BRIDGE         = 2,
+	ACPI_DMAR_SCOPE_TYPE_IOAPIC         = 3,
+	ACPI_DMAR_SCOPE_TYPE_HPET           = 4,
+	ACPI_DMAR_SCOPE_TYPE_NAMESPACE      = 5,
+	ACPI_DMAR_SCOPE_TYPE_RESERVED       = 6 /* 6 and greater are reserved */
+};
+
+struct iommu_domain {
+	uint16_t vm_id;
+	uint32_t addr_width;   /* address width of the domain */
+	uint64_t trans_table_ptr;
+};
+
+union source {
+	uint16_t ioapic_id;
+	union pci_bdf msi;
+};
+
+struct intr_source {
+	bool is_msi;
+	union source src;
+	/*
+	 * pid_paddr = 0: invalid address, indicate that remapped mode shall be used
+	 *
+	 * pid_paddr != 0: physical address of posted interrupt descriptor, indicate
+	 * that posted mode shall be used
+	 */
+	uint64_t pid_paddr;
+};
 
 static inline uint8_t dmar_ver_major(uint64_t version)
 {
@@ -172,11 +213,6 @@ static inline uint8_t iommu_ecap_pt(uint64_t ecap)
 	return ((uint8_t)(ecap >> 6U) & 1U);
 }
 
-static inline uint8_t iommu_ecap_sc(uint64_t ecap)
-{
-	return ((uint8_t)(ecap >> 7U) & 1U);
-}
-
 static inline uint16_t iommu_ecap_iro(uint64_t ecap)
 {
 	return ((uint16_t)(ecap >> 8U) & 0x3ffU);
@@ -279,14 +315,12 @@ static inline uint8_t iommu_ecap_pds(uint64_t ecap)
 #define DMA_GSTS_CFIS (1U << 23U)
 
 /* CCMD_REG */
-#define DMA_CCMD_ICC (1UL << 63U)
-#define DMA_CCMD_ICC_32 (1U << 31U)
-#define DMA_CCMD_GLOBAL_INVL (1UL << 61U)
-#define DMA_CCMD_DOMAIN_INVL (2UL << 61U)
-#define DMA_CCMD_DEVICE_INVL (3UL << 61U)
+#define DMA_CONTEXT_GLOBAL_INVL (1UL << 4U)
+#define DMA_CONTEXT_DOMAIN_INVL (2UL << 4U)
+#define DMA_CONTEXT_DEVICE_INVL (3UL << 4U)
 static inline uint64_t dma_ccmd_fm(uint8_t fm)
 {
-	return (((uint64_t)fm & 0x3UL) << 32UL);
+	return (((uint64_t)fm & 0x3UL) << 48UL);
 }
 
 #define DMA_CCMD_MASK_NOBIT 0UL
@@ -295,12 +329,12 @@ static inline uint64_t dma_ccmd_fm(uint8_t fm)
 #define DMA_CCMD_MASK_3BIT 3UL
 static inline uint64_t dma_ccmd_sid(uint16_t sid)
 {
-	return (((uint64_t)sid & 0xffffUL) << 16UL);
+	return (((uint64_t)sid & 0xffffUL) << 32UL);
 }
 
-static inline uint16_t dma_ccmd_did(uint16_t did)
+static inline uint64_t dma_ccmd_did(uint16_t did)
 {
-	return (did & 0xffffU);
+	return (((uint64_t)did & 0xffffUL) << 16UL);
 }
 
 static inline uint8_t dma_ccmd_get_caig_32(uint32_t gaig)
@@ -312,14 +346,14 @@ static inline uint8_t dma_ccmd_get_caig_32(uint32_t gaig)
 /* IOTLB_REG */
 #define DMA_IOTLB_IVT				(((uint64_t)1UL) << 63U)
 #define DMA_IOTLB_IVT_32			(((uint32_t)1U)  << 31U)
-#define DMA_IOTLB_GLOBAL_INVL			(((uint64_t)1UL) << 60U)
-#define DMA_IOTLB_DOMAIN_INVL			(((uint64_t)2UL) << 60U)
-#define DMA_IOTLB_PAGE_INVL			(((uint64_t)3UL) << 60U)
-#define DMA_IOTLB_DR				(((uint64_t)1UL) << 49U)
-#define DMA_IOTLB_DW				(((uint64_t)1UL) << 48U)
+#define DMA_IOTLB_GLOBAL_INVL			(((uint64_t)1UL) << 4U)
+#define DMA_IOTLB_DOMAIN_INVL			(((uint64_t)2UL) << 4U)
+#define DMA_IOTLB_PAGE_INVL			(((uint64_t)3UL) << 4U)
+#define DMA_IOTLB_DR				(((uint64_t)1UL) << 7U)
+#define DMA_IOTLB_DW				(((uint64_t)1UL) << 6U)
 static inline uint64_t dma_iotlb_did(uint16_t did)
 {
-	return (((uint64_t)did & 0xffffUL) << 32UL);
+	return (((uint64_t)did & 0xffffUL) << 16UL);
 }
 
 static inline uint8_t dma_iotlb_get_iaig_32(uint32_t iai)
@@ -331,6 +365,14 @@ static inline uint8_t dma_iotlb_get_iaig_32(uint32_t iai)
 static inline uint8_t dma_iotlb_invl_addr_am(uint8_t am)
 {
 	return (am & 0x3fU);
+}
+
+/* IEC_REG */
+#define DMAR_IECI_INDEXED		(((uint64_t)1UL) << 4U)
+#define DMAR_IEC_GLOBAL_INVL		(((uint64_t)0UL) << 4U)
+static inline uint64_t dma_iec_index(uint16_t index, uint8_t index_mask)
+{
+	return ((((uint64_t)index & 0xFFFFU) << 32U) | (((uint64_t)index_mask & 0x1FU) << 27U));
 }
 
 #define DMA_IOTLB_INVL_ADDR_IH_UNMODIFIED	(((uint64_t)1UL) << 6U)
@@ -430,6 +472,9 @@ static inline uint16_t dma_frcd_up_sid(uint64_t up_sid)
 	return ((uint16_t)up_sid & 0xffffU);
 }
 
+#define MAX_DRHDS		DRHD_COUNT
+#define MAX_DRHD_DEVSCOPES	16U
+
 #define DMAR_CONTEXT_TRANSLATION_TYPE_TRANSLATED 0x00U
 #define DMAR_CONTEXT_TRANSLATION_TYPE_RESERVED 0x01U
 #define DMAR_CONTEXT_TRANSLATION_TYPE_PASSED_THROUGH 0x02U
@@ -439,6 +484,8 @@ static inline uint16_t dma_frcd_up_sid(uint64_t up_sid)
 #define DEVFUN(dev, fun)            (((dev & 0x1FU) << 3U) | ((fun & 0x7U)))
 
 struct dmar_dev_scope {
+	enum acpi_dmar_scope_type type;
+	uint8_t id;
 	uint8_t bus;
 	uint8_t devfun;
 };
@@ -458,7 +505,61 @@ struct dmar_info {
 	struct dmar_drhd *drhd_units;
 };
 
-extern struct dmar_info *get_dmar_info(void);
+struct dmar_entry {
+	uint64_t lo_64;
+	uint64_t hi_64;
+};
+
+union dmar_ir_entry {
+	struct dmar_entry value;
+
+	union {
+		/* Remapped mode */
+		struct {
+			uint64_t present:1;
+			uint64_t fpd:1;
+			uint64_t dest_mode:1;
+			uint64_t rh:1;
+			uint64_t trigger_mode:1;
+			uint64_t delivery_mode:3;
+			uint64_t avail:4;
+			uint64_t rsvd_1:3;
+			uint64_t mode:1;
+			uint64_t vector:8;
+			uint64_t rsvd_2:8;
+			uint64_t dest:32;
+
+			uint64_t sid:16;
+			uint64_t sq:2;
+			uint64_t svt:2;
+			uint64_t rsvd_3:44;
+		} remap;
+
+		/* Posted mode */
+		struct {
+			uint64_t present:1;
+			uint64_t fpd:1;
+			uint64_t rsvd_1:6;
+			uint64_t avail:4;
+			uint64_t rsvd_2:2;
+			uint64_t urgent:1;
+			uint64_t mode:1;
+			uint64_t vector:8;
+			uint64_t rsvd_3:14;
+			uint64_t pda_l:26;
+
+			uint64_t sid:16;
+			uint64_t sq:2;
+			uint64_t svt:2;
+			uint64_t rsvd_4:12;
+			uint64_t pda_h:32;
+		} post;
+	} bits __packed;
+};
+
+#ifdef CONFIG_ACPI_PARSE_ENABLED
+int32_t parse_dmar_table(struct dmar_info *plat_dmar_info);
+#endif
 
 /**
  * @file vtd.h
@@ -485,9 +586,11 @@ struct iommu_domain;
 /**
  * @brief Assign a device specified by bus & devfun to a iommu domain.
  *
- * Remove the device from the SOS_VM domain (if present), and add it to the specific domain.
+ * Remove the device from the from_domain (if non-NULL), and add it to the to_domain (if non-NULL).
+ * API silently fails to add/remove devices to/from domains that are under "Ignored" DMAR units.
  *
- * @param[in]    domain iommu domain the device is assigned to
+ * @param[in]    from_domain iommu domain from which the device is removed from
+ * @param[in]    to_domain iommu domain to which the device is assgined to
  * @param[in]    bus the 8-bit bus number of the device
  * @param[in]    devfun the 8-bit device(5-bit):function(3-bit) of the device
  *
@@ -497,24 +600,7 @@ struct iommu_domain;
  * @pre domain != NULL
  *
  */
-int32_t assign_iommu_device(struct iommu_domain *domain, uint8_t bus, uint8_t devfun);
-
-/**
- * @brief Unassign a device specified by bus & devfun from a iommu domain .
- *
- * Remove the device from the specific domain, and then add it to the SOS_VM domain (if present).
- *
- * @param[in]    domain iommu domain the device is assigned to
- * @param[in]    bus the 8-bit bus number of the device
- * @param[in]    devfun the 8-bit device(5-bit):function(3-bit) of the device
- *
- * @retval 0 on success.
- * @retval 1 fail to unassign the device
- *
- * @pre domain != NULL
- *
- */
-int32_t unassign_iommu_device(const struct iommu_domain *domain, uint8_t bus, uint8_t devfun);
+int32_t move_pt_device(const struct iommu_domain *from_domain, const struct iommu_domain *to_domain, uint8_t bus, uint8_t devfun);
 
 /**
  * @brief Create a iommu domain for a VM specified by vm_id.
@@ -557,14 +643,6 @@ void destroy_iommu_domain(struct iommu_domain *domain);
 void enable_iommu(void);
 
 /**
- * @brief Disable translation of IOMMUs.
- *
- * Disable address translation of all IOMMUs, which are not ignored on the platform.
- *
- */
-void disable_iommu(void);
-
-/**
  * @brief Suspend IOMMUs.
  *
  * Suspend all IOMMUs, which are not ignored on the platform.
@@ -594,31 +672,55 @@ void resume_iommu(void);
 int32_t init_iommu(void);
 
 /**
- * @brief Init SOS_VM domain of iommu.
+ * @brief Reserve num continuous IRTEs.
  *
- * Create SOS_VM domain using the Normal World's EPT table of SOS_VM as address translation table.
- * All PCI devices are added to the SOS_VM domain when creating it.
+ * @param[in] intr_src filled with type of interrupt source and the source
+ * @param[in] num number of IRTEs to reserve
+ * @param[out] start_id stard index of reserved IRTEs, caller should check the value is INVALID_IRTE_ID or not.
  *
- * @param[in] sos_vm pointer to SOS_VM
+ * @retval 0 on success, caller should check whether the returned start index is valid or not.
+ * @retval -EINVAL if corresponding DMAR is not preset.
  *
- * @pre sos_vm shall point to SOS_VM
- *
- * @remark to reduce boot time & memory cost, a config IOMMU_INIT_BUS_LIMIT, which limit the bus number.
+ * @pre num can only be 2, 4, 8, 16 or 32
  *
  */
-void init_iommu_sos_vm_domain(struct acrn_vm *sos_vm);
+int32_t dmar_reserve_irte(const struct intr_source *intr_src, uint16_t num, uint16_t *start_id);
 
 /**
- * @brief check the iommu if support cache snoop.
+ * @brief Assign RTE for Interrupt Remapping Table.
  *
- * @param[in] vm pointer to VM to check
+ * @param[in] intr_src filled with type of interrupt source and the source
+ * @param[in] irte filled with info about interrupt deliverymode, destination and destination mode
+ * @param[in] idx_in if this value is INVALID_IRTE_ID, a new IRTE will be allocated, otherwise, use the IRTE directly.
+ * @param[out] idx_out return the actual IRTE index used, need to check whether the returned value is valid or not.
  *
- * @retval true support
- * @retval false not support
+ * @retval -EINVAL if corresponding DMAR is not preset
+ * @retval 0 on success, caller should check whether the returned start index is valid or not.
  *
  */
-bool iommu_snoop_supported(const struct acrn_vm *vm);
+int32_t dmar_assign_irte(const struct intr_source *intr_src, union dmar_ir_entry *irte,
+	uint16_t idx_in, uint16_t *idx_out);
 
+/**
+ * @brief Free RTE for Interrupt Remapping Table.
+ *
+ * @param[in] intr_src filled with type of interrupt source and the source
+ * @param[in] index into Interrupt Remapping Table
+ *
+ */
+void dmar_free_irte(const struct intr_source *intr_src, uint16_t index);
+
+/**
+ * @brief Flash cacheline(s) for a specific address with specific size.
+ *
+ * Flash cacheline(s) for a specific address with specific size,
+ * if all IOMMUs active support page-walk coherency, cacheline(s) are not fluashed.
+ *
+ * @param[in] p the address of the buffer, whose cache need to be invalidated
+ * @param[in] size the size of the buffer
+ *
+ */
+void iommu_flush_cache(const void *p, uint32_t size);
 /**
   * @}
   */

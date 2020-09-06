@@ -36,15 +36,17 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <assert.h>
+#include <log.h>
 
 #include "vmmapi.h"
 
+extern char *vmname;
+
 #define HUGETLB_LV1		0
 #define HUGETLB_LV2		1
-#define HUGETLB_LV_MAX	2
+#define HUGETLB_LV_MAX		2
 
-#define MAX_PATH_LEN 128
+#define MAX_PATH_LEN 256
 
 #define HUGETLBFS_MAGIC       0x958458f6
 
@@ -58,6 +60,17 @@
 #define SYS_PATH_LV2  "/sys/kernel/mm/hugepages/hugepages-1048576kB/"
 #define SYS_NR_HUGEPAGES  "nr_hugepages"
 #define SYS_FREE_HUGEPAGES  "free_hugepages"
+
+/* File used for lock between different processes access to hugetlbfs.
+ * We observed when access hugetlbfs from different process to allocate
+ * huge page at the same time could fail. So use file lock here to make
+ * sure hugetlbfs is accessed sequentially.
+ *
+ * We use file range (0..9) for hugetlbfs access lock.
+ */
+#define	ACRN_HUGETLB_LOCK_FILE "/run/hugepage/acrn/lock"
+#define	LOCK_OFFSET_START	0
+#define	LOCK_OFFSET_END		10
 
 /* hugetlb_info record private information for one specific hugetlbfs:
  * - mounted: is hugetlbfs mounted for below mount_path
@@ -123,6 +136,35 @@ static struct hugetlb_info hugetlb_priv[HUGETLB_LV_MAX] = {
 static void *ptr;
 static size_t total_size;
 static int hugetlb_lv_max;
+static int lock_fd;
+
+static int lock_acrn_hugetlb(void)
+{
+	int ret;
+
+	ret = lockf(lock_fd, F_LOCK, LOCK_OFFSET_END);
+
+	if (ret < 0) {
+		pr_err("lock acrn hugetlb failed with errno: %d\n", errno);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int unlock_acrn_hugetlb(void)
+{
+	int ret;
+
+	ret = lockf(lock_fd, F_ULOCK, LOCK_OFFSET_END);
+
+	if (ret < 0) {
+		pr_err("lock acrn hugetlb failed with errno: %d\n", errno);
+		return ret;
+	}
+
+	return 0;
+}
 
 static int open_hugetlbfs(struct vmctx *ctx, int level)
 {
@@ -133,18 +175,18 @@ static int open_hugetlbfs(struct vmctx *ctx, int level)
 	struct statfs fs;
 
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return -EINVAL;
 	}
 
 	path = hugetlb_priv[level].node_path;
 	memset(path, '\0', MAX_PATH_LEN);
-	strncpy(path, hugetlb_priv[level].mount_path, MAX_PATH_LEN);
+	snprintf(path, MAX_PATH_LEN, "%s%s/", hugetlb_priv[level].mount_path, ctx->name);
 
 	len = strnlen(path, MAX_PATH_LEN);
 	/* UUID will use 32 bytes */
 	if (len + 32 > MAX_PATH_LEN) {
-		perror("PATH overflow");
+		pr_err("PATH overflow");
 		return -ENOMEM;
 	}
 
@@ -160,17 +202,17 @@ static int open_hugetlbfs(struct vmctx *ctx, int level)
 	*(path + len) = '\0';
 	strncat(path, uuid_str, strnlen(uuid_str, sizeof(uuid_str)));
 
-	printf("open hugetlbfs file %s\n", path);
+	pr_info("open hugetlbfs file %s\n", path);
 
 	hugetlb_priv[level].fd = open(path, O_CREAT | O_RDWR, 0644);
 	if (hugetlb_priv[level].fd  < 0) {
-		perror("Open hugtlbfs failed");
+		pr_err("Open hugtlbfs failed");
 		return -EINVAL;
 	}
 
 	/* get the pagesize */
 	if (fstatfs(hugetlb_priv[level].fd, &fs) != 0) {
-		perror("Failed to get statfs fo hugetlbfs");
+		pr_err("Failed to get statfs fo hugetlbfs");
 		return -EINVAL;
 	}
 
@@ -190,7 +232,7 @@ static int open_hugetlbfs(struct vmctx *ctx, int level)
 static void close_hugetlbfs(int level)
 {
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return;
 	}
 
@@ -205,7 +247,7 @@ static void close_hugetlbfs(int level)
 static bool should_enable_hugetlb_level(int level)
 {
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return false;
 	}
 
@@ -228,7 +270,7 @@ static int mmap_hugetlbfs_from_level(struct vmctx *ctx, int level, size_t len,
 	int fd, i;
 
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return -EINVAL;
 	}
 
@@ -238,12 +280,12 @@ static int mmap_hugetlbfs_from_level(struct vmctx *ctx, int level, size_t len,
 	if (addr == MAP_FAILED)
 		return -ENOMEM;
 
-	printf("mmap 0x%lx@%p\n", len, addr);
+	pr_info("mmap 0x%lx@%p\n", len, addr);
 
 	/* pre-allocate hugepages by touch them */
 	pagesz = hugetlb_priv[level].pg_size;
 
-	printf("touch %ld pages with pagesz 0x%lx\n", len/pagesz, pagesz);
+	pr_info("touch %ld pages with pagesz 0x%lx\n", len/pagesz, pagesz);
 
 	for (i = 0; i < len/pagesz; i++) {
 		*(volatile char *)addr = *addr;
@@ -265,7 +307,6 @@ static int mmap_hugetlbfs(struct vmctx *ctx, size_t offset,
 		pg_size = hugetlb_priv[level].pg_size;
 
 		while (len > 0) {
-			assert((offset & (pg_size - 1)) == 0);
 			ret = mmap_hugetlbfs_from_level(ctx, level, len, offset, skip);
 
 			if (ret < 0 && level > HUGETLB_LV1) {
@@ -295,7 +336,6 @@ static void get_lowmem_param(struct hugetlb_info *htlb,
 static size_t adj_lowmem_param(struct hugetlb_info *htlb,
 		struct hugetlb_info *htlb_prev, int adj_size)
 {
-	assert(htlb->lowmem >= adj_size);
 	htlb->lowmem -= adj_size;
 	htlb_prev->lowmem += adj_size;
 
@@ -312,7 +352,6 @@ static void get_highmem_param(struct hugetlb_info *htlb,
 static size_t adj_highmem_param(struct hugetlb_info *htlb,
 		struct hugetlb_info *htlb_prev, int adj_size)
 {
-	assert(htlb->highmem >= adj_size);
 	htlb->highmem -= adj_size;
 	htlb_prev->highmem += adj_size;
 
@@ -329,48 +368,56 @@ static void get_biosmem_param(struct hugetlb_info *htlb,
 static size_t adj_biosmem_param(struct hugetlb_info *htlb,
 		struct hugetlb_info *htlb_prev, int adj_size)
 {
-	assert(htlb->biosmem >= adj_size);
 	htlb->biosmem -= adj_size;
 	htlb_prev->biosmem += adj_size;
 
 	return htlb->biosmem;
 }
 
+static int rm_hugetlb_dirs(int level)
+{
+	char path[MAX_PATH_LEN]={0};
+
+	if (level >= HUGETLB_LV_MAX) {
+		pr_err("exceed max hugetlb level");
+		return -EINVAL;
+	}
+
+	snprintf(path,MAX_PATH_LEN, "%s%s/",hugetlb_priv[level].mount_path,vmname);
+
+	if (access(path, F_OK) == 0) {
+		if (rmdir(path) < 0) {
+			pr_err("rmdir failed");
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int create_hugetlb_dirs(int level)
 {
-	char tmp_path[MAX_PATH_LEN], *path;
+	char path[MAX_PATH_LEN]={0};
 	int i;
 	size_t len;
 
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return -EINVAL;
 	}
 
-	path = hugetlb_priv[level].mount_path;
+	snprintf(path,MAX_PATH_LEN, "%s%s/",hugetlb_priv[level].mount_path,vmname);
+
 	len = strnlen(path, MAX_PATH_LEN);
-	if (len == MAX_PATH_LEN || len == 0) {
-		perror("invalid path len");
-		return -EINVAL;
-	}
-
-	memset(tmp_path, '\0', MAX_PATH_LEN);
-	strncpy(tmp_path, path, MAX_PATH_LEN);
-
-	if ((tmp_path[len - 1] != '/') && (len < MAX_PATH_LEN - 1))
-		tmp_path[len] = '/';
-
-	len = strnlen(tmp_path, MAX_PATH_LEN);
 	for (i = 1; i < len; i++) {
-		if (tmp_path[i] == '/') {
-			tmp_path[i] = 0;
-			if (access(tmp_path, F_OK) != 0) {
-				if (mkdir(tmp_path, 0755) < 0) {
-					perror("mkdir failed");
+		if (path[i] == '/') {
+			path[i] = 0;
+			if (access(path, F_OK) != 0) {
+				if (mkdir(path, 0755) < 0) {
+					pr_err("mkdir failed");
 					return -1;
 				}
 			}
-			tmp_path[i] = '/';
+			path[i] = '/';
 		}
 	}
 
@@ -380,17 +427,20 @@ static int create_hugetlb_dirs(int level)
 static int mount_hugetlbfs(int level)
 {
 	int ret;
+	char path[MAX_PATH_LEN];
 
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return -EINVAL;
 	}
 
 	if (hugetlb_priv[level].mounted)
 		return 0;
 
+	snprintf(path, MAX_PATH_LEN, "%s%s", hugetlb_priv[level].mount_path,vmname);
+
 	/* only support x86 as HUGETLB level-1 2M page, level-2 1G page*/
-	ret = mount("none", hugetlb_priv[level].mount_path, "hugetlbfs",
+	ret = mount("none", path, "hugetlbfs",
 		0, hugetlb_priv[level].mount_opt);
 	if (ret == 0)
 		hugetlb_priv[level].mounted = true;
@@ -400,13 +450,18 @@ static int mount_hugetlbfs(int level)
 
 static void umount_hugetlbfs(int level)
 {
+	char path[MAX_PATH_LEN];
+
 	if (level >= HUGETLB_LV_MAX) {
-		perror("exceed max hugetlb level");
+		pr_err("exceed max hugetlb level");
 		return;
 	}
 
+	snprintf(path, MAX_PATH_LEN, "%s%s", hugetlb_priv[level].mount_path,vmname);
+
+
 	if (hugetlb_priv[level].mounted) {
-		umount(hugetlb_priv[level].mount_path);
+		umount(path);
 		hugetlb_priv[level].mounted = false;
 	}
 }
@@ -420,14 +475,14 @@ static int read_sys_info(const char *sys_path)
 
 	fp = fopen(sys_path, "r");
 	if (fp == NULL) {
-		printf("can't open: %s, err: %s\n", sys_path, strerror(errno));
+		pr_err("can't open: %s, err: %s\n", sys_path, strerror(errno));
 		return 0;
 	}
 
 	memset(tmp_buf, 0, 12);
 	result = fread(&tmp_buf, sizeof(char), 8, fp);
 	if (result <= 0)
-		printf("read %s, error: %s, please check!\n",
+		pr_err("read %s, error: %s, please check!\n",
 			sys_path, strerror(errno));
 	else
 		pages = strtol(tmp_buf, NULL, 10);
@@ -452,7 +507,7 @@ static bool hugetlb_check_memgap(void)
 		if (hugetlb_priv[lvl].pages_delta > 0)
 			has_gap = true;
 
-		printf("level %d free/need pages:%d/%d page size:0x%x\n", lvl,
+		pr_info("level %d free/need pages:%d/%d page size:0x%x\n", lvl,
 			free_pages, need_pages, hugetlb_priv[lvl].pg_size);
 	}
 
@@ -474,12 +529,12 @@ static void reserve_more_pages(int level)
 	/* system cmd to reserve needed huge pages */
 	fp = popen(cmd_buf, "r");
 	if (fp == NULL) {
-		printf("cmd: %s failed!\n", cmd_buf);
+		pr_err("cmd: %s failed!\n", cmd_buf);
 		return;
 	}
 	pclose(fp);
 
-	printf("to reserve pages (+orig %d): %s\n", orig_pages, cmd_buf);
+	pr_info("to reserve pages (+orig %d): %s\n", orig_pages, cmd_buf);
 	cur_pages = read_sys_info(hugetlb_priv[level].nr_pages_path);
 	hugetlb_priv[level].pages_delta = total_pages - cur_pages;
 }
@@ -504,7 +559,7 @@ static bool release_larger_freepage(int level_limit)
 
 		fp = popen(cmd_buf, "r");
 		if (fp == NULL) {
-			printf("cmd to free mem: %s failed!\n", cmd_buf);
+			pr_err("cmd to free mem: %s failed!\n", cmd_buf);
 			return false;
 		}
 		pclose(fp);
@@ -543,7 +598,7 @@ static bool hugetlb_reserve_pages(void)
 	int left_gap = 0, pg_size;
 	int level;
 
-	printf("to reserve more free pages:\n");
+	pr_info("to reserve more free pages:\n");
 	for (level = hugetlb_lv_max - 1; level >= HUGETLB_LV1; level--) {
 		if (hugetlb_priv[level].pages_delta <= 0)
 			continue;
@@ -580,16 +635,16 @@ static bool hugetlb_reserve_pages(void)
 	}
 
 	if (level >= HUGETLB_LV1) {
-		printf("level %d pages gap: %d failed to reserve!\n",
+		pr_err("level %d pages gap: %d failed to reserve!\n",
 			level, left_gap);
 		return false;
 	}
 
-	printf("now enough free pages are reserved!\n");
+	pr_info("now enough free pages are reserved!\n");
 	return true;
 }
 
-bool check_hugetlb_support(void)
+bool init_hugetlb(void)
 {
 	int level;
 
@@ -598,21 +653,35 @@ bool check_hugetlb_support(void)
 			return false;
 	}
 
-	for (level = HUGETLB_LV1; level < HUGETLB_LV_MAX; level++) {
-		if (mount_hugetlbfs(level) < 0) {
-			level--;
+	for (level = HUGETLB_LV1; level < HUGETLB_LV_MAX; level++)
+		if (mount_hugetlbfs(level) < 0)
 			break;
-		}
-	}
 
-	if (level < HUGETLB_LV1) /* mount fail for level 1 */
+	if (level == HUGETLB_LV1) /* mount fail for level 1 */
 		return false;
-	else if (level == HUGETLB_LV1) /* mount fail for level 2 */
-		printf("WARNING: only level 1 hugetlb supported");
+	else if (level == HUGETLB_LV2) /* mount fail for level 2 */
+		pr_warn("WARNING: only level 1 hugetlb supported");
+
+	lock_fd = open(ACRN_HUGETLB_LOCK_FILE, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+	if (lock_fd < 0) {
+		return false;
+	}
+	lseek(lock_fd, SEEK_SET, LOCK_OFFSET_START);
 
 	hugetlb_lv_max = level;
 
 	return true;
+}
+
+void uninit_hugetlb(void)
+{
+	int level;
+	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
+		umount_hugetlbfs(level);
+		rm_hugetlb_dirs(level);
+	}
+
+	close(lock_fd);
 }
 
 int hugetlb_setup_memory(struct vmctx *ctx)
@@ -622,23 +691,14 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 	bool has_gap;
 
 	if (ctx->lowmem == 0) {
-		perror("vm requests 0 memory");
+		pr_err("vm requests 0 memory");
 		goto err;
 	}
-
-	/* for first time DM start UOS, hugetlbfs is already mounted by
-	 * check_hugetlb_support; but for reboot, here need re-mount
-	 * it as it already be umount by hugetlb_unsetup_memory
-	 * TODO: actually, correct reboot process should not change memory
-	 * layout, the setup_memory should be removed from reboot process
-	 */
-	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++)
-		mount_hugetlbfs(level);
 
 	/* open hugetlbfs and get pagesize for two level */
 	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
 		if (open_hugetlbfs(ctx, level) < 0) {
-			perror("failed to open hugetlbfs");
+			pr_err("failed to open hugetlbfs");
 			goto err;
 		}
 	}
@@ -652,14 +712,7 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 	ctx->highmem =
 		ALIGN_DOWN(ctx->highmem, hugetlb_priv[HUGETLB_LV1].pg_size);
 
-	/*
-	 * High BIOS resides right below 4GB.
-	 * Therefore, at least 4GB of memory space is needed.
-	 */
-	if (ctx->biosmem > 0 || ctx->highmem > 0)
-		total_size = 4 * GB + ctx->highmem;
-	else
-		total_size = ctx->lowmem;
+	total_size = ctx->highmem_gpa_base + ctx->highmem;
 
 	/* check & set hugetlb level memory size for lowmem/biosmem/highmem */
 	lowmem = ctx->lowmem;
@@ -684,11 +737,13 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 		}
 	}
 
+	lock_acrn_hugetlb();
+
 	/* it will check each level memory need */
 	has_gap = hugetlb_check_memgap();
 	if (has_gap) {
 		if (!hugetlb_reserve_pages())
-			goto err;
+			goto err_lock;
 	}
 
 	/* align up total size with huge page size for vma alignment */
@@ -700,22 +755,22 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 	}
 
 	/* dump hugepage trying to setup */
-	printf("\ntry to setup hugepage with:\n");
+	pr_info("\ntry to setup hugepage with:\n");
 	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
-		printf("\tlevel %d - lowmem 0x%lx, biosmem 0x%lx, highmem 0x%lx\n",
+		pr_info("\tlevel %d - lowmem 0x%lx, biosmem 0x%lx, highmem 0x%lx\n",
 			level,
 			hugetlb_priv[level].lowmem,
 			hugetlb_priv[level].biosmem,
 			hugetlb_priv[level].highmem);
 	}
-	printf("total_size 0x%lx\n\n", total_size);
+	pr_info("total_size 0x%lx\n\n", total_size);
 
 	/* basic overview vma */
 	ptr = mmap(NULL, total_size, PROT_NONE,
 			MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	if (ptr == MAP_FAILED) {
-		perror("anony mmap fail");
-		goto err;
+		pr_err("anony mmap fail");
+		goto err_lock;
 	}
 
 	/* align up baseaddr according to hugepage level size */
@@ -726,31 +781,34 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 			break;
 		}
 	}
-	printf("mmap ptr 0x%p -> baseaddr 0x%p\n", ptr, ctx->baseaddr);
+	pr_info("mmap ptr 0x%p -> baseaddr 0x%p\n", ptr, ctx->baseaddr);
 
 	/* mmap lowmem */
 	if (mmap_hugetlbfs(ctx, 0, get_lowmem_param, adj_lowmem_param) < 0) {
-		perror("lowmem mmap failed");
-		goto err;
+		pr_err("lowmem mmap failed");
+		goto err_lock;
 	}
 
 	/* mmap highmem */
-	if (mmap_hugetlbfs(ctx, 4 * GB, get_highmem_param, adj_highmem_param) < 0) {
-		perror("highmem mmap failed");
-		goto err;
+	if (mmap_hugetlbfs(ctx, ctx->highmem_gpa_base,
+				get_highmem_param, adj_highmem_param) < 0) {
+		pr_err("highmem mmap failed");
+		goto err_lock;
 	}
 
 	/* mmap biosmem */
 	if (mmap_hugetlbfs(ctx, 4 * GB - ctx->biosmem,
 				get_biosmem_param, adj_biosmem_param) < 0) {
-		perror("biosmem mmap failed");
-		goto err;
+		pr_err("biosmem mmap failed");
+		goto err_lock;
 	}
 
+	unlock_acrn_hugetlb();
+
 	/* dump hugepage really setup */
-	printf("\nreally setup hugepage with:\n");
+	pr_info("\nreally setup hugepage with:\n");
 	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
-		printf("\tlevel %d - lowmem 0x%lx, biosmem 0x%lx, highmem 0x%lx\n",
+		pr_info("\tlevel %d - lowmem 0x%lx, biosmem 0x%lx, highmem 0x%lx\n",
 			level,
 			hugetlb_priv[level].lowmem,
 			hugetlb_priv[level].biosmem,
@@ -764,21 +822,29 @@ int hugetlb_setup_memory(struct vmctx *ctx)
 
 	/* map ept for biosmem */
 	if (ctx->biosmem > 0) {
+		/*
+		 * The High BIOS region can behave as RAM and be
+		 * modified by the boot firmware itself (e.g. OVMF
+		 * NV data storage region).
+		 */
 		if (vm_map_memseg_vma(ctx, ctx->biosmem, 4 * GB - ctx->biosmem,
 			(uint64_t)(ctx->baseaddr + 4 * GB - ctx->biosmem),
-			PROT_READ | PROT_EXEC) < 0)
+			PROT_ALL) < 0)
 		goto err;
 	}
 
 	/* map ept for highmem */
 	if (ctx->highmem > 0) {
-		if (vm_map_memseg_vma(ctx, ctx->highmem, 4 * GB,
-			(uint64_t)(ctx->baseaddr + 4 * GB), PROT_ALL) < 0)
+		if (vm_map_memseg_vma(ctx, ctx->highmem, ctx->highmem_gpa_base,
+			(uint64_t)(ctx->baseaddr + ctx->highmem_gpa_base),
+			PROT_ALL) < 0)
 			goto err;
 	}
 
 	return 0;
 
+err_lock:
+	unlock_acrn_hugetlb();
 err:
 	if (ptr) {
 		munmap(ptr, total_size);
@@ -786,8 +852,8 @@ err:
 	}
 	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
 		close_hugetlbfs(level);
-		umount_hugetlbfs(level);
 	}
+
 	return -ENOMEM;
 }
 
@@ -803,6 +869,5 @@ void hugetlb_unsetup_memory(struct vmctx *ctx)
 
 	for (level = HUGETLB_LV1; level < hugetlb_lv_max; level++) {
 		close_hugetlbfs(level);
-		umount_hugetlbfs(level);
 	}
 }

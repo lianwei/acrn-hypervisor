@@ -148,8 +148,8 @@
 /* 32-bit host-state fields */
 #define VMX_HOST_IA32_SYSENTER_CS  0x00004c00U
 /* natural-width control fields */
-#define VMX_CR0_MASK     0x00006000U
-#define VMX_CR4_MASK     0x00006002U
+#define VMX_CR0_GUEST_HOST_MASK     0x00006000U
+#define VMX_CR4_GUEST_HOST_MASK     0x00006002U
 #define VMX_CR0_READ_SHADOW    0x00006004U
 #define VMX_CR4_READ_SHADOW    0x00006006U
 #define VMX_CR3_TARGET_0    0x00006008U
@@ -325,9 +325,6 @@
 #define VMX_EPT_INVEPT_SINGLE_CONTEXT	(1U << 25U)
 #define VMX_EPT_INVEPT_GLOBAL_CONTEXT	(1U << 26U)
 
-#define VMX_MIN_NR_VPID 		1U
-#define VMX_MAX_NR_VPID 		(1U << 5U)
-
 #define VMX_VPID_TYPE_INDIVIDUAL_ADDR	0UL
 #define VMX_VPID_TYPE_SINGLE_CONTEXT	1UL
 #define VMX_VPID_TYPE_ALL_CONTEXT	2UL
@@ -377,6 +374,37 @@
 #define VMX_INT_TYPE_HW_EXP		3U
 #define VMX_INT_TYPE_SW_EXP		6U
 
+/* Posted Interrupt Descriptor (PID) in VT-d spec */
+struct pi_desc {
+	/* Posted Interrupt Requests, one bit per requested vector */
+	uint64_t pir[4];
+
+	union {
+		struct {
+			/* Outstanding Notification */
+			uint16_t on:1;
+
+			/* Suppress Notification, of non-urgent interrupts */
+			uint16_t sn:1;
+
+			uint16_t rsvd_1:14;
+
+			/* Notification Vector */
+			uint8_t nv;
+
+			uint8_t rsvd_2;
+
+			/* Notification destination, a physical LAPIC ID */
+			uint32_t ndst;
+		} bits;
+
+		uint64_t value;
+	} control;
+
+	uint32_t rsvd[6];
+} __aligned(64);
+
+
 /* External Interfaces */
 void vmx_on(void);
 void vmx_off(void);
@@ -403,4 +431,5 @@ void exec_vmwrite64(uint32_t field_full, uint64_t value);
 void exec_vmclear(void *addr);
 void exec_vmptrld(void *addr);
 
+#define POSTED_INTR_ON  0U
 #endif /* VMX_H_ */

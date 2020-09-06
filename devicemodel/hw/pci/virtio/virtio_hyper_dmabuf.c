@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <pthread.h>
 
 #include "dm.h"
@@ -116,6 +115,7 @@ virtio_hyper_dmabuf_k_dev_set(const char *name, int vmid, int nvq,
 {
 	/* init kdev */
 	strncpy(kdev.name, name, VBS_NAME_LEN);
+	kdev.name[VBS_NAME_LEN - 1] = '\0';
 	kdev.vmid = vmid;
 	kdev.nvq = nvq;
 	kdev.negotiated_features = feature;
@@ -342,8 +342,9 @@ virtio_hyper_dmabuf_deinit(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 		virtio_hyper_dmabuf_k_stop();
 		virtio_hyper_dmabuf_k_reset();
 		kstatus = VIRTIO_DEV_INITIAL;
-		assert(vbs_k_hyper_dmabuf_fd >= 0);
-		close(vbs_k_hyper_dmabuf_fd);
+		if (vbs_k_hyper_dmabuf_fd >= 0) {
+			close(vbs_k_hyper_dmabuf_fd);
+		}
 		vbs_k_hyper_dmabuf_fd = -1;
 	}
 

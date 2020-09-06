@@ -30,22 +30,31 @@
 
 #define pr_prefix	"vioapic: "
 
-#include <hypervisor.h>
+#include <vm.h>
+#include <errno.h>
+#include <irq.h>
+#include <ept.h>
+#include <assign.h>
+#include <logmsg.h>
+#include <ioapic.h>
 
-#define	RTBL_RO_BITS	(uint32_t)(IOAPIC_RTE_REM_IRR | IOAPIC_RTE_DELIVS)
-#define NEED_EOI_EXIT_UPDATE (IOAPIC_RTE_TRGRMOD | IOAPIC_RTE_DELMOD | IOAPIC_RTE_DEST_MASK | IOAPIC_RTE_INTVEC)
+#define	RTBL_RO_BITS	((uint32_t)0x00004000U | (uint32_t)0x00001000U) /*Remote IRR and Delivery Status bits*/
 
-#define ACRN_DBG_IOAPIC	6U
+#define DBG_LEVEL_VIOAPIC	6U
 #define ACRN_IOAPIC_VERSION	0x11U
 
-#define IOAPIC_ID_MASK		0x0f000000U
 #define MASK_ALL_INTERRUPTS   0x0001000000010000UL
 
+static inline struct acrn_vioapics *vm_ioapics(const struct acrn_vm *vm)
+{
+	return (struct acrn_vioapics *)&(vm->arch_vm.vioapics);
+}
+
 /**
- * @pre pin < vioapic_pincount(vm)
+ * @pre pin < vioapic->chipinfo.nr_pins
  */
 static void
-vioapic_generate_intr(struct acrn_vioapic *vioapic, uint32_t pin)
+vioapic_generate_intr(struct acrn_single_vioapic *vioapic, uint32_t pin)
 {
 	uint32_t vector, dest, delmode;
 	union ioapic_rte rte;
@@ -53,55 +62,79 @@ vioapic_generate_intr(struct acrn_vioapic *vioapic, uint32_t pin)
 
 	rte = vioapic->rtbl[pin];
 
-	if ((rte.full & IOAPIC_RTE_INTMASK) == IOAPIC_RTE_INTMSET) {
-		dev_dbg(ACRN_DBG_IOAPIC, "ioapic pin%hhu: masked", pin);
+	if (rte.bits.intr_mask == IOAPIC_RTE_MASK_SET) {
+		dev_dbg(DBG_LEVEL_VIOAPIC, "ioapic pin%hhu: masked", pin);
 	} else {
-		phys = ((rte.full & IOAPIC_RTE_DESTMOD) == IOAPIC_RTE_DESTPHY);
-		delmode = (uint32_t)(rte.full & IOAPIC_RTE_DELMOD);
-		level = ((rte.full & IOAPIC_RTE_TRGRLVL) != 0UL);
+		phys = (rte.bits.dest_mode == IOAPIC_RTE_DESTMODE_PHY);
+		delmode = rte.bits.delivery_mode;
+		level = (rte.bits.trigger_mode == IOAPIC_RTE_TRGRMODE_LEVEL);
 
 		/* For level trigger irq, avoid send intr if
 		 * previous one hasn't received EOI
 		 */
-		if (!level || ((vioapic->rtbl[pin].full & IOAPIC_RTE_REM_IRR) == 0UL)) {
+		if (!level || (vioapic->rtbl[pin].bits.remote_irr == 0UL)) {
 			if (level) {
-				vioapic->rtbl[pin].full |= IOAPIC_RTE_REM_IRR;
+				vioapic->rtbl[pin].bits.remote_irr = IOAPIC_RTE_REM_IRR;
 			}
-			vector = rte.u.lo_32 & IOAPIC_RTE_LOW_INTVEC;
-			dest = (uint32_t)(rte.full >> IOAPIC_RTE_DEST_SHIFT);
-			vlapic_deliver_intr(vioapic->vm, level, dest, phys, delmode, vector, false);
+			vector = rte.bits.vector;
+			dest = rte.bits.dest_field;
+			vlapic_receive_intr(vioapic->vm, level, dest, phys, delmode, vector, false);
 		}
 	}
 }
 
 /**
- * @pre pin < vioapic_pincount(vm)
+ * @pre pin < vioapic->chipinfo.nr_pins
  */
 static void
-vioapic_set_pinstate(struct acrn_vioapic *vioapic, uint32_t pin, uint32_t level)
+vioapic_set_pinstate(struct acrn_single_vioapic *vioapic, uint32_t pin, uint32_t level)
 {
 	uint32_t old_lvl;
 	union ioapic_rte rte;
 
-	if (pin < REDIR_ENTRIES_HW) {
+	if (pin < vioapic->chipinfo.nr_pins) {
 		rte = vioapic->rtbl[pin];
 		old_lvl = (uint32_t)bitmap_test((uint16_t)(pin & 0x3FU), &vioapic->pin_state[pin >> 6U]);
 		if (level == 0U) {
 			/* clear pin_state and deliver interrupt according to polarity */
 			bitmap_clear_nolock((uint16_t)(pin & 0x3FU), &vioapic->pin_state[pin >> 6U]);
-			if (((rte.full & IOAPIC_RTE_INTPOL) != 0UL)
+			if ((rte.bits.intr_polarity == IOAPIC_RTE_INTPOL_ALO)
 				&& old_lvl != level) {
 				vioapic_generate_intr(vioapic, pin);
 			}
 		} else {
 			/* set pin_state and deliver intrrupt according to polarity */
 			bitmap_set_nolock((uint16_t)(pin & 0x3FU), &vioapic->pin_state[pin >> 6U]);
-			if (((rte.full & IOAPIC_RTE_INTPOL) == 0UL)
+			if ((rte.bits.intr_polarity == IOAPIC_RTE_INTPOL_AHI)
 				&& old_lvl != level) {
 				vioapic_generate_intr(vioapic, pin);
 			}
 		}
 	}
+}
+
+
+static struct acrn_single_vioapic *
+vgsi_to_vioapic_and_vpin(const struct acrn_vm *vm, uint32_t vgsi, uint32_t *vpin)
+{
+	struct acrn_single_vioapic *vioapic;
+	uint8_t vioapic_index = 0U;
+
+	if (is_sos_vm(vm)) {
+		/*
+		 * Utilize platform ioapic_info for SOS VM
+		 */	
+		vioapic_index = get_gsi_to_ioapic_index(vgsi);
+		if (vpin != NULL) {
+			*vpin = gsi_to_ioapic_pin(vgsi);
+		}
+	} else {
+		if (vpin != NULL) {
+			*vpin = vgsi;
+		}
+	}
+	vioapic = (struct acrn_single_vioapic *)&(vm->arch_vm.vioapics.vioapic_array[vioapic_index]);
+	return vioapic;
 }
 
 /**
@@ -111,20 +144,21 @@ vioapic_set_pinstate(struct acrn_vioapic *vioapic, uint32_t pin, uint32_t level)
  * operation be done with ioapic lock.
  *
  * @param[in] vm        Pointer to target VM
- * @param[in] irqline   Target IRQ number
+ * @param[in] vgsi   	Target GSI number
  * @param[in] operation Action options: GSI_SET_HIGH/GSI_SET_LOW/
  *			GSI_RAISING_PULSE/GSI_FALLING_PULSE
  *
- * @pre irqline < vioapic_pincount(vm)
+ * @pre vgsi < get_vm_gsicount(vm)
+ * @pre vm != NULL
  * @return None
  */
 void
-vioapic_set_irqline_nolock(const struct acrn_vm *vm, uint32_t irqline, uint32_t operation)
+vioapic_set_irqline_nolock(const struct acrn_vm *vm, uint32_t vgsi, uint32_t operation)
 {
-	struct acrn_vioapic *vioapic;
-	uint32_t pin = irqline;
+	struct acrn_single_vioapic *vioapic;
+	uint32_t pin;
 
-	vioapic = vm_ioapic(vm);
+	vioapic = vgsi_to_vioapic_and_vpin(vm, vgsi, &pin);
 
 	switch (operation) {
 	case GSI_SET_HIGH:
@@ -153,100 +187,43 @@ vioapic_set_irqline_nolock(const struct acrn_vm *vm, uint32_t irqline, uint32_t 
  * @brief Set vIOAPIC IRQ line status.
  *
  * @param[in] vm        Pointer to target VM
- * @param[in] irqline   Target IRQ number
+ * @param[in] vgsi  	Target GSI number
  * @param[in] operation Action options: GSI_SET_HIGH/GSI_SET_LOW/
  *			GSI_RAISING_PULSE/GSI_FALLING_PULSE
  *
- * @pre irqline < vioapic_pincount(vm)
+ * @pre vgsi < get_vm_gsicount(vm)
+ * @pre vm != NULL
  *
  * @return None
  */
 void
-vioapic_set_irqline_lock(const struct acrn_vm *vm, uint32_t irqline, uint32_t operation)
+vioapic_set_irqline_lock(const struct acrn_vm *vm, uint32_t vgsi, uint32_t operation)
 {
-	struct acrn_vioapic *vioapic = vm_ioapic(vm);
+	uint64_t rflags;
+	struct acrn_single_vioapic *vioapic;
 
-	spinlock_obtain(&(vioapic->mtx));
-	vioapic_set_irqline_nolock(vm, irqline, operation);
-	spinlock_release(&(vioapic->mtx));
-}
-
-/*
- * Generate eoi_exit_bitmap and request each VCPU to update VMCS fields
- * To be called with vioapic->mtx
- * @pre vioapic != NULL
- */
-static void
-vioapic_update_eoi_exit(const struct acrn_vioapic *vioapic)
-{
-	struct acrn_vcpu *vcpu;
-	union ioapic_rte rte;
-	uint64_t mask;
-	uint32_t vector, delmode, dest;
-	uint32_t pin, pincount;
-	uint16_t vcpu_id;
-	bool level, phys;
-
-	dev_dbg(ACRN_DBG_IOAPIC, "%s", __func__);
-
-	/* clear old bitmap to generate new bitmap */
-	foreach_vcpu(vcpu_id, vioapic->vm, vcpu) {
-		spinlock_obtain(&(vcpu->arch.lock));
-		vcpu_reset_eoi_exit_all(vcpu);
-	}
-
-	/* go through RTEs and set corresponding bits of eoi_exit_bitmap */
-	pincount = vioapic_pincount(vioapic->vm);
-	for (pin = 0U; pin < pincount; pin++) {
-		rte = vioapic->rtbl[pin];
-
-		level = ((rte.full & IOAPIC_RTE_TRGRLVL) != 0UL);
-		vector = rte.u.lo_32 & IOAPIC_RTE_LOW_INTVEC;
-
-		if (level && ((vector >= 0x20U) && (vector < NR_MAX_VECTOR))) {
-			/* if level-trigger and vector is valid */
-			delmode = (uint32_t)(rte.full & IOAPIC_RTE_DELMOD);
-
-			if ((delmode != APIC_DELMODE_FIXED) && (delmode != APIC_DELMODE_LOWPRIO)) {
-				dev_dbg(ACRN_DBG_IOAPIC,
-					"Ignoring level trigger-mode for delivery-mode 0x%x", delmode);
-			} else {
-				dest = (uint32_t)((rte.full) >> IOAPIC_RTE_DEST_SHIFT);
-				phys = ((rte.full & IOAPIC_RTE_DESTLOG) == 0UL);
-				vlapic_calcdest(vioapic->vm, &mask, dest, phys, false);
-				
-				for (vcpu_id = ffs64(mask); vcpu_id != INVALID_BIT_INDEX; vcpu_id = ffs64(mask)) {
-					vcpu = vcpu_from_vid(vioapic->vm, vcpu_id);
-					vcpu_set_eoi_exit(vcpu, vector);
-					bitmap_clear_nolock(vcpu_id, &mask);
-				}
-			}
-		}
-	}
-
-	/* make request if eoi_exit_bitmap changed */
-	foreach_vcpu(vcpu_id, vioapic->vm, vcpu) {
-		spinlock_release(&(vcpu->arch.lock));
-		vcpu_make_request(vcpu, ACRN_REQUEST_EOI_EXIT_UPDATE);
-	}
+	vioapic = vgsi_to_vioapic_and_vpin(vm, vgsi, NULL);
+	spinlock_irqsave_obtain(&(vioapic->lock), &rflags);
+	vioapic_set_irqline_nolock(vm, vgsi, operation);
+	spinlock_irqrestore_release(&(vioapic->lock), rflags);
 }
 
 static uint32_t
-vioapic_indirect_read(const struct acrn_vioapic *vioapic, uint32_t addr)
+vioapic_indirect_read(const struct acrn_single_vioapic *vioapic, uint32_t addr)
 {
 	uint32_t regnum, ret = 0U;
-	uint32_t pin, pincount = vioapic_pincount(vioapic->vm);
+	uint32_t pin, pincount = vioapic->chipinfo.nr_pins;
 
 	regnum = addr & 0xffU;
 	switch (regnum) {
 	case IOAPIC_ID:
-		ret = vioapic->id;
+		ret = (uint32_t)vioapic->chipinfo.id << IOAPIC_ID_SHIFT;
 		break;
 	case IOAPIC_VER:
 		ret = ((pincount - 1U) << MAX_RTE_SHIFT) | ACRN_IOAPIC_VERSION;
 		break;
 	case IOAPIC_ARB:
-		ret = vioapic->id;
+		ret = (uint32_t)vioapic->chipinfo.id << IOAPIC_ID_SHIFT;
 		break;
 	default:
 		/*
@@ -274,39 +251,37 @@ vioapic_indirect_read(const struct acrn_vioapic *vioapic, uint32_t addr)
 	return ret;
 }
 
-static inline bool vioapic_need_intr(const struct acrn_vioapic *vioapic, uint16_t pin)
+static inline bool vioapic_need_intr(const struct acrn_single_vioapic *vioapic, uint16_t pin)
 {
 	uint32_t lvl;
 	union ioapic_rte rte;
-	bool ret;
+	bool ret = false;
 
-	if (pin >= REDIR_ENTRIES_HW) {
-		ret = false;
-	} else {
+	if (pin < vioapic->chipinfo.nr_pins) {
 		rte = vioapic->rtbl[pin];
 		lvl = (uint32_t)bitmap_test(pin & 0x3FU, &vioapic->pin_state[pin >> 6U]);
-		ret = !!((((rte.full & IOAPIC_RTE_INTPOL) != 0UL) && lvl == 0U) ||
-			(((rte.full & IOAPIC_RTE_INTPOL) == 0UL) && lvl != 0U));
+		ret = !!(((rte.bits.intr_polarity == IOAPIC_RTE_INTPOL_ALO) && lvl == 0U) ||
+			((rte.bits.intr_polarity == IOAPIC_RTE_INTPOL_AHI) && lvl != 0U));
 	}
 
 	return ret;
 }
 
 /*
- * Due to the race between vcpus, ensure to do spinlock_obtain(&(vioapic->mtx))
- * & spinlock_release(&(vioapic->mtx)) by caller.
+ * Due to the race between vcpus and vioapic->lock could be accessed from softirq, ensure to do
+ * spinlock_irqsave_obtain(&(vioapic->lock), &rflags) & spinlock_irqrestore_release(&(vioapic->lock), rflags)
+ * by caller.
  */
-static void vioapic_indirect_write(struct acrn_vioapic *vioapic, uint32_t addr, uint32_t data)
+static void vioapic_indirect_write(struct acrn_single_vioapic *vioapic, uint32_t addr, uint32_t data)
 {
-	union ioapic_rte last, new;
-	uint64_t changed;
+	union ioapic_rte last, new, changed;
 	uint32_t regnum;
-	uint32_t pin, pincount = vioapic_pincount(vioapic->vm);
+	uint32_t pin, pincount = vioapic->chipinfo.nr_pins;
 
 	regnum = addr & 0xffUL;
 	switch (regnum) {
 	case IOAPIC_ID:
-		vioapic->id = data & IOAPIC_ID_MASK;
+		vioapic->chipinfo.id = (uint8_t)((data & IOAPIC_ID_MASK) >> IOAPIC_ID_SHIFT);
 		break;
 	case IOAPIC_VER:
 	case IOAPIC_ARB:
@@ -344,19 +319,19 @@ static void vioapic_indirect_write(struct acrn_vioapic *vioapic, uint32_t addr, 
 		 * 0x20 version IOAPIC, otherwise use switch Trigger Mode to
 		 * Edge Sensitive to clear it.
 		 */
-		if ((new.full & IOAPIC_RTE_TRGRLVL) == 0U) {
-			new.full &= ~IOAPIC_RTE_REM_IRR;
+		if (new.bits.trigger_mode == IOAPIC_RTE_TRGRMODE_EDGE) {
+			new.bits.remote_irr = 0U;
 		}
 
-		changed = last.full ^ new.full;
+		changed.full = last.full ^ new.full;
 		/* pin0 from vpic mask/unmask */
-		if ((pin == 0U) && ((changed & IOAPIC_RTE_INTMASK) != 0UL)) {
+		if ((pin == 0U) && (changed.bits.intr_mask != 0UL)) {
 			/* mask -> umask */
-			if ((last.full & IOAPIC_RTE_INTMASK) != 0UL) {
+			if (last.bits.intr_mask == IOAPIC_RTE_MASK_SET) {
 				if ((vioapic->vm->wire_mode == VPIC_WIRE_NULL) ||
 						(vioapic->vm->wire_mode == VPIC_WIRE_INTR)) {
 					vioapic->vm->wire_mode = VPIC_WIRE_IOAPIC;
-					dev_dbg(ACRN_DBG_IOAPIC, "vpic wire mode -> IOAPIC");
+					dev_dbg(DBG_LEVEL_VIOAPIC, "vpic wire mode -> IOAPIC");
 				} else {
 					pr_err("WARNING: invalid vpic wire mode change");
 					wire_mode_valid = false;
@@ -365,24 +340,22 @@ static void vioapic_indirect_write(struct acrn_vioapic *vioapic, uint32_t addr, 
 			} else {
 				if (vioapic->vm->wire_mode == VPIC_WIRE_IOAPIC) {
 					vioapic->vm->wire_mode = VPIC_WIRE_INTR;
-					dev_dbg(ACRN_DBG_IOAPIC, "vpic wire mode -> INTR");
+					dev_dbg(DBG_LEVEL_VIOAPIC, "vpic wire mode -> INTR");
 				}
 			}
 		}
 
 		if (wire_mode_valid) {
 			vioapic->rtbl[pin] = new;
-			dev_dbg(ACRN_DBG_IOAPIC, "ioapic pin%hhu: redir table entry %#lx",
+			dev_dbg(DBG_LEVEL_VIOAPIC, "ioapic pin%hhu: redir table entry %#lx",
 				pin, vioapic->rtbl[pin].full);
-			/*
-			 * If "Trigger Mode" or "Delivery Mode" or "Vector"
-			 * in the redirection table entry have changed then
-			 * rendezvous all the vcpus to update their vlapic
-			 * trigger-mode registers.
-			 */
-			if ((changed & NEED_EOI_EXIT_UPDATE) != 0UL) {
-				dev_dbg(ACRN_DBG_IOAPIC, "ioapic pin%hhu: recalculate vlapic trigger-mode reg",	pin);
-				vioapic_update_eoi_exit(vioapic);
+
+			/* remap for ptdev */
+			if ((new.bits.intr_mask == IOAPIC_RTE_MASK_CLR) || (last.bits.intr_mask  == IOAPIC_RTE_MASK_CLR)) {
+				/* VM enable intr */
+				/* NOTE: only support max 256 pin */
+				
+				(void)ptirq_intx_pin_remap(vioapic->vm, vioapic->chipinfo.gsi_base + pin, INTX_CTLR_IOAPIC);
 			}
 
 			/*
@@ -391,32 +364,26 @@ static void vioapic_indirect_write(struct acrn_vioapic *vioapic, uint32_t addr, 
 			 * - previous interrupt has been EOIed
 			 * - pin level is asserted
 			 */
-			if (((vioapic->rtbl[pin].full & IOAPIC_RTE_INTMASK) == IOAPIC_RTE_INTMCLR) &&
-				((vioapic->rtbl[pin].full & IOAPIC_RTE_REM_IRR) == 0UL) &&
+			if ((vioapic->rtbl[pin].bits.intr_mask == IOAPIC_RTE_MASK_CLR) &&
+				(vioapic->rtbl[pin].bits.remote_irr == 0UL) &&
 				vioapic_need_intr(vioapic, (uint16_t)pin)) {
-				dev_dbg(ACRN_DBG_IOAPIC, "ioapic pin%hhu: asserted at rtbl write", pin);
+				dev_dbg(DBG_LEVEL_VIOAPIC, "ioapic pin%hhu: asserted at rtbl write", pin);
 				vioapic_generate_intr(vioapic, pin);
-			}
-
-			/* remap for ptdev */
-			if (((new.full & IOAPIC_RTE_INTMASK) == 0UL) || ((last.full & IOAPIC_RTE_INTMASK) == 0UL)) {
-				/* VM enable intr */
-				/* NOTE: only support max 256 pin */
-				(void)ptirq_intx_pin_remap(vioapic->vm, pin, PTDEV_VPIN_IOAPIC);
 			}
 		}
 	}
 }
 
 static void
-vioapic_mmio_rw(struct acrn_vioapic *vioapic, uint64_t gpa,
+vioapic_mmio_rw(struct acrn_single_vioapic *vioapic, uint64_t gpa,
 		uint32_t *data, bool do_read)
 {
 	uint32_t offset;
+	uint64_t rflags;
 
-	offset = (uint32_t)(gpa - VIOAPIC_BASE);
+	offset = (uint32_t)(gpa - vioapic->chipinfo.addr);
 
-	spinlock_obtain(&(vioapic->mtx));
+	spinlock_irqsave_obtain(&(vioapic->lock), &rflags);
 
 	/* The IOAPIC specification allows 32-bit wide accesses to the
 	 * IOAPIC_REGSEL (offset 0) and IOAPIC_WINDOW (offset 16) registers.
@@ -445,108 +412,153 @@ vioapic_mmio_rw(struct acrn_vioapic *vioapic, uint64_t gpa,
 		break;
 	}
 
-	spinlock_release(&(vioapic->mtx));
+	spinlock_irqrestore_release(&(vioapic->lock), rflags);
 }
 
-void
-vioapic_process_eoi(struct acrn_vm *vm, uint32_t vector)
+/*
+ * @pre vm != NULL
+ */
+static void
+vioapic_process_eoi(struct acrn_single_vioapic *vioapic, uint32_t vector)
 {
-	struct acrn_vioapic *vioapic;
-	uint32_t pin, pincount = vioapic_pincount(vm);
+	uint32_t pin, pincount = vioapic->chipinfo.nr_pins;
 	union ioapic_rte rte;
+	uint64_t rflags;
 
 	if ((vector < VECTOR_DYNAMIC_START) || (vector > NR_MAX_VECTOR)) {
 		pr_err("vioapic_process_eoi: invalid vector %u", vector);
 	}
 
-	vioapic = vm_ioapic(vm);
-	dev_dbg(ACRN_DBG_IOAPIC, "ioapic processing eoi for vector %u", vector);
+	dev_dbg(DBG_LEVEL_VIOAPIC, "ioapic processing eoi for vector %u", vector);
 
 	/* notify device to ack if assigned pin */
 	for (pin = 0U; pin < pincount; pin++) {
 		rte = vioapic->rtbl[pin];
-		if (((rte.u.lo_32 & IOAPIC_RTE_LOW_INTVEC) != vector) ||
-			((rte.full & IOAPIC_RTE_REM_IRR) == 0UL)) {
+		if ((rte.bits.vector != vector) ||
+			(rte.bits.remote_irr == 0U)) {
 			continue;
 		}
 
-		ptirq_intx_ack(vm, pin, PTDEV_VPIN_IOAPIC);
+		ptirq_intx_ack(vioapic->vm, vioapic->chipinfo.gsi_base + pin, INTX_CTLR_IOAPIC);
 	}
 
 	/*
 	 * XXX keep track of the pins associated with this vector instead
 	 * of iterating on every single pin each time.
 	 */
-	spinlock_obtain(&(vioapic->mtx));
+	spinlock_irqsave_obtain(&(vioapic->lock), &rflags);
 	for (pin = 0U; pin < pincount; pin++) {
 		rte = vioapic->rtbl[pin];
-		if (((rte.u.lo_32 & IOAPIC_RTE_LOW_INTVEC) != vector) ||
-			((rte.full & IOAPIC_RTE_REM_IRR) == 0UL)) {
+		if ((rte.bits.vector != vector) ||
+			(rte.bits.remote_irr == 0U)) {
 			continue;
 		}
 
-		vioapic->rtbl[pin].full &= (~IOAPIC_RTE_REM_IRR);
+		vioapic->rtbl[pin].bits.remote_irr = 0U;
 		if (vioapic_need_intr(vioapic, (uint16_t)pin)) {
-			dev_dbg(ACRN_DBG_IOAPIC,
+			dev_dbg(DBG_LEVEL_VIOAPIC,
 				"ioapic pin%hhu: asserted at eoi", pin);
 			vioapic_generate_intr(vioapic, pin);
 		}
 	}
-	spinlock_release(&(vioapic->mtx));
+	spinlock_irqrestore_release(&(vioapic->lock), rflags);
 }
 
-void
-vioapic_reset(struct acrn_vioapic *vioapic)
+void vioapic_broadcast_eoi(const struct acrn_vm *vm, uint32_t vector)
+{
+	struct acrn_single_vioapic *vioapic;
+	uint8_t vioapic_index;
+
+	/*
+	 * For platforms with multiple IO-APICs, EOI message from LAPIC is
+	 * broadcast to all IO-APICs. Emulating the same behavior here.
+	 */
+
+	for (vioapic_index = 0U; vioapic_index < vm->arch_vm.vioapics.ioapic_num; vioapic_index++) {
+		vioapic = &(vm_ioapics(vm)->vioapic_array[vioapic_index]);
+		vioapic_process_eoi(vioapic, vector);
+	}
+}
+
+static void reset_one_vioapic(struct acrn_single_vioapic *vioapic)
 {
 	uint32_t pin, pincount;
 
 	/* Initialize all redirection entries to mask all interrupts */
-	pincount = vioapic_pincount(vioapic->vm);
+	pincount = vioapic->chipinfo.nr_pins;
 	for (pin = 0U; pin < pincount; pin++) {
 		vioapic->rtbl[pin].full = MASK_ALL_INTERRUPTS;
 	}
-	vioapic->id = 0U;
+	vioapic->chipinfo.id = 0U;
 	vioapic->ioregsel = 0U;
+}
+
+void reset_vioapics(const struct acrn_vm *vm)
+{
+	struct acrn_vioapics *vioapics = vm_ioapics(vm);
+	uint8_t vioapic_index;
+
+	for (vioapic_index = 0U; vioapic_index < vioapics->ioapic_num; vioapic_index++) {
+		reset_one_vioapic(&vioapics->vioapic_array[vioapic_index]);
+	}
 }
 
 void
 vioapic_init(struct acrn_vm *vm)
 {
-	vm->arch_vm.vioapic.vm = vm;
-	spinlock_init(&(vm->arch_vm.vioapic.mtx));
+	static struct ioapic_info virt_ioapic_info = {
+		.nr_pins = VIOAPIC_RTE_NUM,
+		.addr = VIOAPIC_BASE
+	};
 
-	vioapic_reset(vm_ioapic(vm));
+	struct ioapic_info *vioapic_info;
+	uint8_t vioapic_index;
+	struct acrn_single_vioapic *vioapic = NULL;
 
-	(void)register_mmio_emulation_handler(vm,
-			vioapic_mmio_access_handler,
-			(uint64_t)VIOAPIC_BASE,
-			(uint64_t)VIOAPIC_BASE + VIOAPIC_SIZE,
-			vm);
+	if (is_sos_vm(vm)) {
+		vm->arch_vm.vioapics.ioapic_num = get_platform_ioapic_info(&vioapic_info);
+	} else {
+		vm->arch_vm.vioapics.ioapic_num = 1U;
+		vioapic_info = &virt_ioapic_info;
+	}
+
+	for (vioapic_index = 0U; vioapic_index < vm->arch_vm.vioapics.ioapic_num; vioapic_index++) {
+		vioapic = &vm->arch_vm.vioapics.vioapic_array[vioapic_index];
+		spinlock_init(&(vioapic->lock));
+		vioapic->chipinfo = vioapic_info[vioapic_index];
+
+		vioapic->vm = vm;
+		reset_one_vioapic(vioapic);
+
+		register_mmio_emulation_handler(vm, vioapic_mmio_access_handler, (uint64_t)vioapic->chipinfo.addr,
+					(uint64_t)vioapic->chipinfo.addr + VIOAPIC_SIZE, (void *)vioapic, false);
+		ept_del_mr(vm, (uint64_t *)vm->arch_vm.nworld_eptp, (uint64_t)vioapic->chipinfo.addr, VIOAPIC_SIZE);
+	}
+
+	/*
+	 * Maximum number of GSI is computed as GSI base of the IOAPIC i.e. enumerated last in ACPI MADT
+	 * plus the number of interrupt pins of that IOAPIC.
+	 */
+	if (vioapic != NULL) {
+		vm->arch_vm.vioapics.nr_gsi = vioapic->chipinfo.gsi_base + vioapic->chipinfo.nr_pins;
+	}
 }
 
 uint32_t
-vioapic_pincount(const struct acrn_vm *vm)
+get_vm_gsicount(const struct acrn_vm *vm)
 {
-	uint32_t ret;
-
-	if (is_sos_vm(vm)) {
-	        ret = REDIR_ENTRIES_HW;
-	} else {
-		ret = VIOAPIC_RTE_NUM;
-	}
-
-	return ret;
+	return vm->arch_vm.vioapics.nr_gsi;
 }
 
+/*
+ * @pre handler_private_data != NULL
+ */
 int32_t vioapic_mmio_access_handler(struct io_request *io_req, void *handler_private_data)
 {
-	struct acrn_vm *vm = (struct acrn_vm *)handler_private_data;
-	struct acrn_vioapic *vioapic;
+	struct acrn_single_vioapic *vioapic = (struct acrn_single_vioapic *)handler_private_data;
 	struct mmio_request *mmio = &io_req->reqs.mmio;
 	uint64_t gpa = mmio->address;
 	int32_t ret = 0;
-
-	vioapic = vm_ioapic(vm);
 
 	/* Note all RW to IOAPIC are 32-Bit in size */
 	if (mmio->size == 4UL) {
@@ -569,13 +581,15 @@ int32_t vioapic_mmio_access_handler(struct io_request *io_req, void *handler_pri
 }
 
 /**
- * @pre vm->arch_vm.vioapic != NULL
+ * @pre vm->arch_vm.vioapics != NULL
+ * @pre vgsi < get_vm_gsicount(vm)
  * @pre rte != NULL
  */
-void vioapic_get_rte(struct acrn_vm *vm, uint32_t pin, union ioapic_rte *rte)
+void vioapic_get_rte(const struct acrn_vm *vm, uint32_t vgsi, union ioapic_rte *rte)
 {
-	struct acrn_vioapic *vioapic;
+	struct acrn_single_vioapic *vioapic;
+	uint32_t pin;
+	vioapic = vgsi_to_vioapic_and_vpin(vm, vgsi, &pin);
 
-	vioapic = vm_ioapic(vm);
 	*rte = vioapic->rtbl[pin];
 }

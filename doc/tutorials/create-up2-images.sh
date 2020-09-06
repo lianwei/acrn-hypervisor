@@ -34,31 +34,28 @@ create_sos_images() {
 
     mountpoint sos_rootfs || return 1
 
-    swupd verify --install --path=sos_rootfs --contenturl=$MIRRORURL --versionurl=$MIRRORURL --format=staging -m ${VERSION} ||
+    swupd os-install --path=sos_rootfs --contenturl=$MIRRORURL --versionurl=$MIRRORURL --format=staging -V ${VERSION} -N -b ||
     {
         echo "Failed to swupd install"
         return 1
     }
 
-    swupd bundle-add $SOS_BUNDLE_LIST --path=sos_rootfs --contenturl=$MIRRORURL --versionurl=$MIRRORURL --format=staging ||
+    swupd bundle-add --path=sos_rootfs --contenturl=$MIRRORURL --versionurl=$MIRRORURL --format=staging $SOS_BUNDLE_LIST ||
     {
         echo "Failed to swupd bundle add"
         return 1
     }
 
-    SOS_BOOTARGS_DEBUG=${ACRN_HV_CODE_PATH}/devicemodel/samples/up2/sos_bootargs_debug.txt
+    if [[ ! ${ACRN_SBL} || ! -f ${ACRN_SBL} ]]
+    then
+        ACRN_SBL=sos_rootfs/usr/lib/acrn/acrn.apl-up2.sbl.sdc.32.out
+    fi
 
-    if [[ ! ${ACRN_SBL} && ! -f ${ACRN_SBL} ]]
-    then 
-        if [ ${ACRN_HV_CODE_PATH} ]
-        then
-            make -C ${ACRN_HV_CODE_PATH} clean || return 1
-            make -C ${ACRN_HV_CODE_PATH} hypervisor BOARD=up2 FIRMWARE=sbl || return 1
-            ACRN_SBL=${ACRN_HV_CODE_PATH}/build/hypervisor/acrn.32.out
-        else
-            echo "Need to provide acrn.sbl or acrn-hypervisor source code path"
-            return 1
-        fi
+    if [ ${ACRN_HV_CODE_PATH} ]
+    then
+        make -C ${ACRN_HV_CODE_PATH} clean || return 1
+        make -C ${ACRN_HV_CODE_PATH} hypervisor BOARD=apl-up2 FIRMWARE=sbl || return 1
+        ACRN_SBL=${ACRN_HV_CODE_PATH}/build/hypervisor/acrn.32.out
     fi
 
     if [ ! -f ${ACRN_SBL} ]
@@ -67,19 +64,13 @@ create_sos_images() {
         return 1
     fi
 
-    if [ -f ${SOS_BOOTARGS_DEBUG} ] 
-    then
-        echo -n "CMDLINE: "
-        echo $(tr '\n' ' ' < $SOS_BOOTARGS_DEBUG) | tee tmp/cmdline
-    else                
-        echo "sos_bootargs_debug.txt is not found"
-        return 1        
-    fi
+    echo "ACRN_SBL:"${ACRN_SBL}
 
+    echo -n "Linux_bzImage" > tmp/linux.txt
     SOS_KERNEL=$(ls sos_rootfs/usr/lib/kernel/org.clearlinux.iot-lts2018-sos*)
     touch tmp/hv_cmdline
 
-    iasimage create -o iasImage -i 0x40300 -d tmp/bxt_dbg_priv_key.pem -p 4 tmp/hv_cmdline ${ACRN_SBL}  tmp/cmdline ${SOS_KERNEL} || 
+    iasimage create -o iasImage -i 0x40300 -d tmp/bxt_dbg_priv_key.pem -p 4 tmp/hv_cmdline ${ACRN_SBL} tmp/linux.txt ${SOS_KERNEL} || 
     {
         echo "stitch iasimage for sos_boot failed!"
         return 1
@@ -121,9 +112,9 @@ create_uos_images() {
     echo mount laag_rootfs/boot >> .cleanup
 
     kernel_version=`readlink laag_rootfs/usr/lib/kernel/default-iot-lts2018 | awk -F '2018.' '{print $2}'`
-    cmdline=`ls laag_rootfs/usr/lib/kernel | grep cmdline-$kernel_version`
 
-    iasimage create -o laag_rootfs/boot/iasImage -i 0x30300 -d tmp/bxt_dbg_priv_key.pem laag_rootfs/usr/lib/kernel/$cmdline laag_rootfs/usr/lib/kernel/default-iot-lts2018
+    echo "" > tmp/uos_cmdline
+    iasimage create -o laag_rootfs/boot/iasImage -i 0x30300 -d tmp/bxt_dbg_priv_key.pem tmp/uos_cmdline laag_rootfs/usr/lib/kernel/default-iot-lts2018
 
 }
 
@@ -145,13 +136,13 @@ cleanup() {
 }
 
 # Default values
-SOS_BASE_BUNDLE_LIST="service-os os-core-update openssh-server software-defined-cockpit"
+SOS_BASE_BUNDLE_LIST="service-os os-core-update openssh-server x11-server"
 SOS_BUNDLE_APPEND=""
 LAAG_BUNDLE_APPEND=""
 SOS_ROOTFS_SIZE=3584
 LAAG_IMAGE_SIZE=10240
 LAAG_VDISK_SIZE=5120
-MIRRORURL="https://cdn.download.clearlinux.org/releases/"
+MIRRORURL="https://cdn.download.clearlinux.org/update/"
 SIGN_KEY="https://download.clearlinux.org/secureboot/DefaultIASSigningPrivateKey.pem"
 IMAGE=all
 
@@ -224,10 +215,6 @@ if [[ ${IMAGE} == "sos" || ${IMAGE} == "all" ]]; then
     if [[ ! ${VERSION} ]]; then
         echo "--clearlinux-version: must be provided for SOS images building."
         exit 1
-    fi
-    if [[ ! ${ACRN_SBL} && ! ${ACRN_HV_CODE_PATH} ]]; then
-    echo "Should provide --acrn-sbl-path or --acrn-code-path for SOS images building"
-    exit 1
     fi
 fi
 

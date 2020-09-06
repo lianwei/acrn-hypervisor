@@ -6,6 +6,7 @@
 
 #ifndef UTIL_H
 #define UTIL_H
+#include <types.h>
 
 #define offsetof(st, m) __builtin_offsetof(st, m)
 #define va_start	__builtin_va_start
@@ -28,6 +29,29 @@
 static inline bool mem_aligned_check(uint64_t value, uint64_t req_align)
 {
 	return ((value & (req_align - 1UL)) == 0UL);
+}
+
+/**
+ * @pre buf != NULL
+ */
+static inline uint8_t calculate_sum8(const void *buf, uint32_t length)
+{
+	uint32_t i;
+	uint8_t sum = 0U;
+
+	for (i = 0U; i < length; i++) {
+		sum += *((const uint8_t *)buf + i);
+	}
+
+	return sum;
+}
+
+/**
+ * @pre buf != NULL
+ */
+static inline uint8_t calculate_checksum8(const void *buf, uint32_t len)
+{
+	return (uint8_t)(0x100U - calculate_sum8(buf, len));
 }
 
 #endif /* UTIL_H */

@@ -25,7 +25,6 @@
  * SUCH DAMAGE.
  */
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +34,7 @@
 #include "types.h"
 #include "atkbdc.h"
 #include "console.h"
+#include "log.h"
 
 /* keyboard device commands */
 #define	PS2KC_RESET_DEV		0xff
@@ -145,7 +145,7 @@ ps2kbd_write(struct ps2kbd_info *kbd, uint8_t val)
 			fifo_put(kbd, PS2KC_ACK);
 			break;
 		default:
-			fprintf(stderr, "Unhandled ps2 keyboard current "
+			pr_err("Unhandled ps2 keyboard current "
 			    "command byte 0x%02x\n", val);
 			break;
 		}
@@ -190,7 +190,7 @@ ps2kbd_write(struct ps2kbd_info *kbd, uint8_t val)
 			fifo_put(kbd, PS2KC_ACK);
 			break;
 		default:
-			fprintf(stderr, "Unhandled ps2 keyboard command "
+			pr_err("Unhandled ps2 keyboard command "
 			    "0x%02x\n", val);
 			break;
 		}
@@ -224,8 +224,6 @@ ps2kbd_keysym_queue(struct ps2kbd_info *kbd,
 		0x4d, 0x15, 0x2d, 0x1b, 0x2c, 0x3c, 0x2a, 0x1d,
 		0x22, 0x35, 0x1a, 0x54, 0x5d, 0x5b, 0x0e, 0x00,
 	};
-
-/* assert(pthread_mutex_isowned_np(&kbd->mtx)); */
 
 	switch (keysym) {
 	case 0x0 ... 0x7f:
@@ -431,7 +429,7 @@ ps2kbd_keysym_queue(struct ps2kbd_info *kbd,
 		fifo_put(kbd, 0x71);
 		break;
 	default:
-		fprintf(stderr, "Unhandled ps2 keyboard keysym 0x%x\n",
+		pr_err("Unhandled ps2 keyboard keysym 0x%x\n",
 		     keysym);
 		break;
 	}
@@ -462,8 +460,10 @@ ps2kbd_init(struct atkbdc_base *base)
 	struct ps2kbd_info *kbd;
 
 	kbd = calloc(1, sizeof(struct ps2kbd_info));
-
-	assert(kbd != NULL);
+	if (!kbd) {
+		pr_err("%s: alloc memory fail!\n", __func__);
+		return NULL;
+	}
 
 	pthread_mutex_init(&kbd->mtx, NULL);
 	fifo_init(kbd);

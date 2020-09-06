@@ -68,6 +68,7 @@
 #include "tpm.h"
 #include "vmmapi.h"
 #include "hpet.h"
+#include "log.h"
 
 /*
  * Define the base address of the ACPI tables, and the offsets to
@@ -84,15 +85,15 @@
 #define FACS_OFFSET		0x3C0
 #define NHLT_OFFSET		0x400
 #define TPM2_OFFSET		0xC00
-#define PSDS_OFFSET		0xE40		/* Reserve 0xC0 for PSD table */
-#define DSDT_OFFSET		0xF00
+#define DSDT_OFFSET		0xE40
 
 #define	ASL_TEMPLATE	"dm.XXXXXXX"
 #define ASL_SUFFIX	".aml"
+#ifndef ASL_COMPILER
 #define ASL_COMPILER	"/usr/sbin/iasl"
+#endif
 
 uint64_t audio_nhlt_len = 0;
-uint32_t csme_sec_cap = 0;
 
 static int basl_keep_temps;
 static int basl_verbose_iasl;
@@ -123,7 +124,6 @@ struct basl_fio {
 #define EFFLUSH(x) fflush(x)
 
 static bool acpi_table_is_valid(int num);
-static int psds_fd = -1;
 
 static int
 basl_fwrite_rsdp(FILE *fp, struct vmctx *ctx)
@@ -182,13 +182,10 @@ basl_fwrite_rsdt(FILE *fp, struct vmctx *ctx)
 		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : %08X\n", num++,
 		    basl_acpi_base + NHLT_OFFSET);
 
-	if (ctx->tpm_dev)
+	if (ctx->tpm_dev || pt_tpm2)
 		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : %08X\n", num++,
 		    basl_acpi_base + TPM2_OFFSET);
 
-	if (acpi_table_is_valid(PSDS_ENTRY_NO))
-		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : %08X\n", num++,
-		    basl_acpi_base + PSDS_OFFSET);
 	EFFLUSH(fp);
 
 	return 0;
@@ -227,13 +224,10 @@ basl_fwrite_xsdt(FILE *fp, struct vmctx *ctx)
 		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : 00000000%08X\n", num++,
 		    basl_acpi_base + NHLT_OFFSET);
 
-	if (ctx->tpm_dev)
+	if (ctx->tpm_dev || pt_tpm2)
 		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : 00000000%08X\n", num++,
 		    basl_acpi_base + TPM2_OFFSET);
 
-	if (acpi_table_is_valid(PSDS_ENTRY_NO))
-		EFPRINTF(fp, "[0004]\t\tACPI Table Address %u : 00000000%08X\n", num++,
-		    basl_acpi_base + PSDS_OFFSET);
 	EFFLUSH(fp);
 
 	return 0;
@@ -274,6 +268,7 @@ basl_fwrite_madt(FILE *fp, struct vmctx *ctx)
 		EFPRINTF(fp, "[0001]\t\tLocal Apic ID : %02x\n", i);
 		EFPRINTF(fp, "[0004]\t\tFlags (decoded below) : 00000001\n");
 		EFPRINTF(fp, "\t\t\tProcessor Enabled : 1\n");
+		EFPRINTF(fp, "\t\t\tRuntime Online Capable : 0\n");
 		EFPRINTF(fp, "\n");
 	}
 
@@ -287,35 +282,37 @@ basl_fwrite_madt(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0004]\t\tInterrupt : 00000000\n");
 	EFPRINTF(fp, "\n");
 
-	/* Legacy IRQ0 is connected to pin 2 of the IOAPIC */
-	EFPRINTF(fp, "[0001]\t\tSubtable Type : 02\n");
-	EFPRINTF(fp, "[0001]\t\tLength : 0A\n");
-	EFPRINTF(fp, "[0001]\t\tBus : 00\n");
-	EFPRINTF(fp, "[0001]\t\tSource : 00\n");
-	EFPRINTF(fp, "[0004]\t\tInterrupt : 00000002\n");
-	EFPRINTF(fp, "[0002]\t\tFlags (decoded below) : 0005\n");
-	EFPRINTF(fp, "\t\t\tPolarity : 1\n");
-	EFPRINTF(fp, "\t\t\tTrigger Mode : 1\n");
-	EFPRINTF(fp, "\n");
+	if (!is_rtvm) {
+		/* Legacy IRQ0 is connected to pin 2 of the IOAPIC */
+		EFPRINTF(fp, "[0001]\t\tSubtable Type : 02\n");
+		EFPRINTF(fp, "[0001]\t\tLength : 0A\n");
+		EFPRINTF(fp, "[0001]\t\tBus : 00\n");
+		EFPRINTF(fp, "[0001]\t\tSource : 00\n");
+		EFPRINTF(fp, "[0004]\t\tInterrupt : 00000002\n");
+		EFPRINTF(fp, "[0002]\t\tFlags (decoded below) : 0005\n");
+		EFPRINTF(fp, "\t\t\tPolarity : 1\n");
+		EFPRINTF(fp, "\t\t\tTrigger Mode : 1\n");
+		EFPRINTF(fp, "\n");
 
-	EFPRINTF(fp, "[0001]\t\tSubtable Type : 02\n");
-	EFPRINTF(fp, "[0001]\t\tLength : 0A\n");
-	EFPRINTF(fp, "[0001]\t\tBus : 00\n");
-	EFPRINTF(fp, "[0001]\t\tSource : %02X\n", SCI_INT);
-	EFPRINTF(fp, "[0004]\t\tInterrupt : %08X\n", SCI_INT);
-	EFPRINTF(fp, "[0002]\t\tFlags (decoded below) : 0000\n");
-	EFPRINTF(fp, "\t\t\tPolarity : 1\n");
-	EFPRINTF(fp, "\t\t\tTrigger Mode : 3\n");
-	EFPRINTF(fp, "\n");
+		EFPRINTF(fp, "[0001]\t\tSubtable Type : 02\n");
+		EFPRINTF(fp, "[0001]\t\tLength : 0A\n");
+		EFPRINTF(fp, "[0001]\t\tBus : 00\n");
+		EFPRINTF(fp, "[0001]\t\tSource : %02X\n", SCI_INT);
+		EFPRINTF(fp, "[0004]\t\tInterrupt : %08X\n", SCI_INT);
+		EFPRINTF(fp, "[0002]\t\tFlags (decoded below) : 000D\n");
+		EFPRINTF(fp, "\t\t\tPolarity : 1\n");
+		EFPRINTF(fp, "\t\t\tTrigger Mode : 3\n");
+		EFPRINTF(fp, "\n");
+	}
 
 	/* Local APIC NMI is connected to LINT 1 on all CPUs */
 	EFPRINTF(fp, "[0001]\t\tSubtable Type : 04\n");
 	EFPRINTF(fp, "[0001]\t\tLength : 06\n");
-	EFPRINTF(fp, "[0001]\t\tProcessorId : FF\n");
+	EFPRINTF(fp, "[0001]\t\tProcessor ID : FF\n");
 	EFPRINTF(fp, "[0002]\t\tFlags (decoded below) : 0005\n");
 	EFPRINTF(fp, "\t\t\tPolarity : 1\n");
 	EFPRINTF(fp, "\t\t\tTrigger Mode : 1\n");
-	EFPRINTF(fp, "[0001]\t\tInterrupt : 01\n");
+	EFPRINTF(fp, "[0001]\t\tInterrupt Input LINT : 01\n");
 	EFPRINTF(fp, "\n");
 
 	EFFLUSH(fp);
@@ -361,7 +358,7 @@ basl_fwrite_fadt(FILE *fp, struct vmctx *ctx)
 	    PM1A_EVT_ADDR);
 	EFPRINTF(fp, "[0004]\t\tPM1B Event Block Address : 00000000\n");
 	EFPRINTF(fp, "[0004]\t\tPM1A Control Block Address : %08X\n",
-	    PM1A_CNT_ADDR);
+	    VIRTUAL_PM1A_CNT_ADDR);
 	EFPRINTF(fp, "[0004]\t\tPM1B Control Block Address : 00000000\n");
 	EFPRINTF(fp, "[0004]\t\tPM2 Control Block Address : 00000000\n");
 	EFPRINTF(fp, "[0004]\t\tPM Timer Block Address : %08X\n",
@@ -371,7 +368,7 @@ basl_fwrite_fadt(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0001]\t\tPM1 Event Block Length : 04\n");
 	EFPRINTF(fp, "[0001]\t\tPM1 Control Block Length : 02\n");
 	EFPRINTF(fp, "[0001]\t\tPM2 Control Block Length : 00\n");
-	EFPRINTF(fp, "[0001]\t\tPM Timer Block Length : 04\n");
+	EFPRINTF(fp, "[0001]\t\tPM Timer Block Length : 00\n");
 	EFPRINTF(fp, "[0001]\t\tGPE0 Block Length : 00\n");
 	EFPRINTF(fp, "[0001]\t\tGPE1 Block Length : 00\n");
 	EFPRINTF(fp, "[0001]\t\tGPE1 Base Offset : 00\n");
@@ -463,7 +460,7 @@ basl_fwrite_fadt(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0001]\t\tBit Offset : 00\n");
 	EFPRINTF(fp, "[0001]\t\tEncoded Access Width : 02 [Word Access:16]\n");
 	EFPRINTF(fp, "[0008]\t\tAddress : 00000000%08X\n",
-	    PM1A_CNT_ADDR);
+	    VIRTUAL_PM1A_CNT_ADDR);
 	EFPRINTF(fp, "\n");
 
 	EFPRINTF(fp,
@@ -556,7 +553,7 @@ basl_fwrite_hpet(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0004]\t\tAsl Compiler Revision : 00000000\n");
 	EFPRINTF(fp, "\n");
 
-	EFPRINTF(fp, "[0004]\t\tTimer Block ID : %08X\n",
+	EFPRINTF(fp, "[0004]\t\tHardware Block ID : %08X\n",
 	    (uint32_t)vhpet_capabilities());
 	EFPRINTF(fp,
 	    "[0012]\t\tTimer Block Register : [Generic Address Structure]\n");
@@ -568,7 +565,7 @@ basl_fwrite_hpet(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0008]\t\tAddress : %016X\n", VHPET_BASE);
 	EFPRINTF(fp, "\n");
 
-	EFPRINTF(fp, "[0001]\t\tHPET Number : 00\n");
+	EFPRINTF(fp, "[0001]\t\tSequence Number : 00\n");
 	EFPRINTF(fp, "[0002]\t\tMinimum Clock Ticks : 0000\n");
 	EFPRINTF(fp, "[0004]\t\tFlags (decoded below) : 00000001\n");
 	EFPRINTF(fp, "\t\t\t4K Page Protect : 1\n");
@@ -600,10 +597,10 @@ basl_fwrite_mcfg(FILE *fp, struct vmctx *ctx)
 	EFPRINTF(fp, "[0008]\t\tReserved : 0\n");
 	EFPRINTF(fp, "\n");
 
-	EFPRINTF(fp, "[0008]\t\tBase Address : %016lX\n", pci_ecfg_base());
-	EFPRINTF(fp, "[0002]\t\tSegment Group: 0000\n");
-	EFPRINTF(fp, "[0001]\t\tStart Bus: 00\n");
-	EFPRINTF(fp, "[0001]\t\tEnd Bus: FF\n");
+	EFPRINTF(fp, "[0008]\t\tBase Address : %016lX\n", PCI_EMUL_ECFG_BASE);
+	EFPRINTF(fp, "[0002]\t\tSegment Group Number: 0000\n");
+	EFPRINTF(fp, "[0001]\t\tStart Bus Number: 00\n");
+	EFPRINTF(fp, "[0001]\t\tEnd Bus Number: FF\n");
 	EFPRINTF(fp, "[0004]\t\tReserved : 0\n");
 	EFFLUSH(fp);
 
@@ -618,7 +615,7 @@ basl_fwrite_nhlt(FILE *fp, struct vmctx *ctx)
 	int fd = open("/sys/firmware/acpi/tables/NHLT", O_RDONLY);
 
 	if (fd < 0) {
-		fprintf(stderr, "Open host NHLT fail! %s\n", strerror(errno));
+		pr_err("Open host NHLT fail! %s\n", strerror(errno));
 		return -1;
 	}
 
@@ -626,7 +623,7 @@ basl_fwrite_nhlt(FILE *fp, struct vmctx *ctx)
 	audio_nhlt_len = lseek(fd, 0, SEEK_END);
 	/* check if file size exceeds reserved room */
 	if (audio_nhlt_len > DSDT_OFFSET - NHLT_OFFSET) {
-		fprintf(stderr, "Host NHLT exceeds reserved room!\n");
+		pr_err("Host NHLT exceeds reserved room!\n");
 		close(fd);
 		return -1;
 	}
@@ -634,7 +631,7 @@ basl_fwrite_nhlt(FILE *fp, struct vmctx *ctx)
 	/* skip 36 bytes as NHLT table header */
 	offset = lseek(fd, 36, SEEK_SET);
 	if (offset != 36) {
-		fprintf(stderr, "Seek NHLT data fail! %s\n", strerror(errno));
+		pr_err("Seek NHLT data fail! %s\n", strerror(errno));
 		close(fd);
 		return -1;
 	}
@@ -658,7 +655,7 @@ basl_fwrite_nhlt(FILE *fp, struct vmctx *ctx)
 		EFPRINTF(fp, "UINT8 : %02X\n", data);
 
 	if (len < 0) {
-		fprintf(stderr, "Read host NHLT fail! %s\n", strerror(errno));
+		pr_err("Read host NHLT fail! %s\n", strerror(errno));
 		close(fd);
 		return -1;
 	}
@@ -666,98 +663,6 @@ basl_fwrite_nhlt(FILE *fp, struct vmctx *ctx)
 	EFFLUSH(fp);
 	close(fd);
 
-	return 0;
-}
-
-/* read len bytes from file specified by fd from offset, and write to file specified by fp */
-static int
-copy_table_pos_len(int fd, int offset, int len, FILE *fp)
-{
-	int pos, i;
-	uint8_t data;
-
-	if ((fd < 0) || (fp == NULL))
-		return -1;
-
-	pos = lseek(fd, offset, SEEK_SET);
-	if (pos != offset)
-		return -1;
-
-	for (i = 0; i < len; i++) {
-		if (read(fd, &data, 1) != 1) {
-			fprintf(stderr, "%s: read fail! %s\n", __func__, strerror(errno));
-			return -1;
-		}
-		EFPRINTF(fp, "UINT8 : %02X\n", data);
-	}
-	return 0;
-}
-
-/* Intel Platform Security Discovery is designed specifically to allow other applications at
- * runtime to know what hardware security capabilities are available on the platform.
- * Format of the PSD structure:
- * [0024] 36 byte common header
- * [0004] PSD Version
- * [0004] CSME Sec Capabilities
- * [0002] SGX Capabilities
- * [0004] FW Version Minor
- * [0004] FW Version Major
- * [0004] FW Version Build Number
- * [0004] FW Version Hot Fix
- * [0010] FW Vendor
- * [0001] EOM State
- * [0001] Secure Boot Enabled
- * [0001] Measured Boot Enabled
- * [0001] Hwrot Type
- * [0001] fwHashIndex
- * [0001] fwHashDataLen
- * [xxxx] fwHashData (if fwHashDataLen != 0)
- */
-static int
-basl_fwrite_psds(FILE *fp, struct vmctx *ctx)
-{
-	EFPRINTF(fp, "/*\n");
-	EFPRINTF(fp, " * dm PSDS template\n");
-	EFPRINTF(fp, " */\n");
-	EFPRINTF(fp, "[0004]\t\tSignature : \"PSDS\"\n");
-	EFPRINTF(fp, "[0004]\t\tTable Length : 00000000\n");
-	EFPRINTF(fp, "[0001]\t\tRevision : 00\n");
-	EFPRINTF(fp, "[0001]\t\tChecksum : 00\n");
-	EFPRINTF(fp, "[0006]\t\tOem ID : \"INTEL \"\n");
-	EFPRINTF(fp, "[0008]\t\tOem Table ID : \"EDK2    \"\n");
-	EFPRINTF(fp, "[0004]\t\tOem Revision : 00000001\n");
-	/* iasl will fill in the compiler ID/revision fields */
-	EFPRINTF(fp, "[0004]\t\tAsl Compiler ID : \"xxxx\"\n");
-	EFPRINTF(fp, "[0004]\t\tAsl Compiler Revision : 00000000\n");
-
-	/* passthru the following @36 - 4 bytes:
-	 * [0004]PSD Version
-	 */
-	if (copy_table_pos_len(psds_fd, 36, 4, fp) != 0) {
-		fprintf(stderr, "Failed to read psds table!\n");
-		return -1;
-	}
-
-	EFPRINTF(fp, "UINT32 : %08X\n", csme_sec_cap);		/* [0004]CSME Sec Capabilities */
-	EFPRINTF(fp, "UINT16 : 0000\n");			/* [0002]SGX Capabilities */
-
-	/* passthru the following @46 - 33 bytes:
-	 * [0010]FW Versions
-	 * [0010]FW Vendor
-	 * [0001]EOM State
-	 */
-	if (copy_table_pos_len(psds_fd, 46, 33, fp) !=0) {
-		fprintf(stderr, "Failed to read psds table!\n");
-		return -1;
-	}
-
-	EFPRINTF(fp, "UINT8 : 00\n");				/* [0001]Secure Boot Enabled */
-	EFPRINTF(fp, "UINT8 : 00\n");				/* [0001]Measured Boot Enabled */
-	EFPRINTF(fp, "UINT8 : 00\n");				/* [0001]Hwrot Type */
-	EFPRINTF(fp, "UINT8 : 00\n");				/* [0001]fwHashIndex */
-	EFPRINTF(fp, "UINT8 : 00\n");				/* [0001]fwHashDataLen */
-
-	EFFLUSH(fp);
 	return 0;
 }
 
@@ -845,6 +750,7 @@ dsdt_line(const char *fmt, ...)
 	return;
 
 err_exit:
+	va_end(ap);
 	dsdt_error = -1;
 }
 
@@ -852,14 +758,13 @@ void
 dsdt_indent(int levels)
 {
 	dsdt_indent_level += levels;
-	assert(dsdt_indent_level >= 0);
 }
 
 void
 dsdt_unindent(int levels)
 {
-	assert(dsdt_indent_level >= levels);
-	dsdt_indent_level -= levels;
+	if (dsdt_indent_level >= levels)
+		dsdt_indent_level -= levels;
 }
 
 void
@@ -954,7 +859,7 @@ basl_fwrite_dsdt(FILE *fp, struct vmctx *ctx)
 
 	pm_write_dsdt(ctx, basl_ncpu);
 
-	if (ctx->tpm_dev)
+	if (ctx->tpm_dev || pt_tpm2)
 		tpm2_crb_fwrite_dsdt();
 
 	dsdt_line("}");
@@ -1156,7 +1061,6 @@ static struct {
 	{ basl_fwrite_facs, FACS_OFFSET, true  },
 	{ basl_fwrite_nhlt, NHLT_OFFSET, false }, /*valid with audio ptdev*/
 	{ basl_fwrite_tpm2, TPM2_OFFSET, false },
-	{ basl_fwrite_psds, PSDS_OFFSET, false }, /*valid when psds present in sos */
 	{ basl_fwrite_dsdt, DSDT_OFFSET, true  }
 };
 
@@ -1164,7 +1068,7 @@ void
 acpi_table_enable(int num)
 {
 	if (num > (ARRAY_SIZE(basl_ftables) - 1)) {
-		fprintf(stderr, "Enable non-existing ACPI tables:%d\n", num);
+		pr_err("Enable non-existing ACPI tables:%d\n", num);
 		return;
 	}
 
@@ -1214,18 +1118,13 @@ acpi_build(struct vmctx *ctx, int ncpu)
 	i = 0;
 	err = basl_make_templates();
 
-	/* Check PSDS in SOS, only present PSDS table to UOS when PSDS present in SOS */
-	psds_fd = open("/sys/firmware/acpi/tables/PSDS", O_RDONLY);
-	if (psds_fd >=0)
-		acpi_table_enable(PSDS_ENTRY_NO);
-
 	/*
 	 * Run through all the ASL files, compiling them and
 	 * copying them into guest memory
 	 */
 	while (!err && (i < ARRAY_SIZE(basl_ftables))) {
 		if ((basl_ftables[i].offset == TPM2_OFFSET) &&
-			(ctx->tpm_dev != NULL)) {
+			(ctx->tpm_dev != NULL || pt_tpm2)) {
 				basl_ftables[i].valid = true;
 		}
 
@@ -1234,9 +1133,6 @@ acpi_build(struct vmctx *ctx, int ncpu)
 					basl_ftables[i].offset);
 		i++;
 	}
-
-	if (psds_fd >=0)
-		close(psds_fd);
 
 	return err;
 }

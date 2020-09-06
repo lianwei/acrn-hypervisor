@@ -35,6 +35,7 @@
 #include "pci_core.h"
 #include "virtio.h"
 #include "timer.h"
+#include <atomic.h>
 
 /*
  * Functions for dealing with generalized "virtual devices" as
@@ -62,7 +63,10 @@ virtio_start_timer(struct acrn_timer *timer, time_t sec, time_t nsec)
 	/* set the delay time it will be started when timer_setting */
 	ts.it_value.tv_sec = sec;
 	ts.it_value.tv_nsec = nsec;
-	assert(acrn_timer_settime(timer, &ts) == 0);
+	if (acrn_timer_settime(timer, &ts) != 0) {
+		pr_err("acrn timer set time failed\n");
+		return;
+	}
 }
 
 static void
@@ -85,6 +89,8 @@ virtio_poll_timer(void *arg, uint64_t nexp)
 
 	for (i = 0; i < base->vops->nvq; i++) {
 		vq = &base->queues[i];
+		if(!vq_ring_ready(vq))
+			continue;
 		vq->used->flags |= VRING_USED_F_NO_NOTIFY;
 		/* TODO: call notify when necessary */
 		if (vq->notify)
@@ -92,8 +98,7 @@ virtio_poll_timer(void *arg, uint64_t nexp)
 		else if (vops->qnotify)
 			(*vops->qnotify)(DEV_STRUCT(base), vq);
 		else
-			fprintf(stderr,
-				"%s: qnotify queue %d: missing vq/vops notify\r\n",
+			pr_err("%s: qnotify queue %d: missing vq/vops notify\r\n",
 				name, i);
 	}
 
@@ -124,7 +129,10 @@ virtio_linkup(struct virtio_base *base, struct virtio_ops *vops,
 	int i;
 
 	/* base and pci_virtio_dev addresses must match */
-	assert((void *)base == pci_virtio_dev);
+	if ((void *)base != pci_virtio_dev) {
+		pr_err("virtio_base and pci_virtio_dev addresses don't match!\n");
+		return;
+	}
 	base->vops = vops;
 	base->dev = dev;
 	dev->arg = base;
@@ -303,10 +311,13 @@ virtio_vq_init(struct virtio_base *base, uint32_t pfn)
 	/* ... and the last page(s) are the used ring. */
 	vq->used = (struct vring_used *)vb;
 
-	/* Mark queue as allocated, and start at 0 when we use it. */
-	vq->flags = VQ_ALLOC;
+	/* Start at 0 when we use it. */
 	vq->last_avail = 0;
 	vq->save_used = 0;
+
+	/* Mark queue as allocated after initialization is complete. */
+	mb();
+	vq->flags = VQ_ALLOC;
 }
 
 /*
@@ -345,13 +356,16 @@ virtio_vq_enable(struct virtio_base *base)
 	vb = paddr_guest2host(base->dev->vmctx, phys, size);
 	vq->used = (struct vring_used *)vb;
 
-	/* Mark queue as allocated, and start at 0 when we use it. */
-	vq->flags = VQ_ALLOC;
+	/* Start at 0 when we use it. */
 	vq->last_avail = 0;
 	vq->save_used = 0;
 
 	/* Mark queue as enabled. */
 	vq->enabled = true;
+
+	/* Mark queue as allocated after initialization is complete. */
+	mb();
+	vq->flags = VQ_ALLOC;
 }
 
 /*
@@ -445,8 +459,7 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 		return 0;
 	if (ndesc > vq->qsize) {
 		/* XXX need better way to diagnose issues */
-		fprintf(stderr,
-		    "%s: ndesc (%u) out of range, driver confused?\r\n",
+		pr_err("%s: ndesc (%u) out of range, driver confused?\r\n",
 		    name, (u_int)ndesc);
 		return -1;
 	}
@@ -464,8 +477,7 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 	vq->last_avail++;
 	for (i = 0; i < VQ_MAX_DESCRIPTORS; next = vdir->next) {
 		if (next >= vq->qsize) {
-			fprintf(stderr,
-			    "%s: descriptor index %u out of range, "
+			pr_err("%s: descriptor index %u out of range, "
 			    "driver confused?\r\n",
 			    name, next);
 			return -1;
@@ -476,16 +488,14 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 			i++;
 		} else if ((base->device_caps &
 		    (1 << VIRTIO_RING_F_INDIRECT_DESC)) == 0) {
-			fprintf(stderr,
-			    "%s: descriptor has forbidden INDIRECT flag, "
+			pr_err("%s: descriptor has forbidden INDIRECT flag, "
 			    "driver confused?\r\n",
 			    name);
 			return -1;
 		} else {
 			n_indir = vdir->len / 16;
 			if ((vdir->len & 0xf) || n_indir == 0) {
-				fprintf(stderr,
-				    "%s: invalid indir len 0x%x, "
+				pr_err("%s: invalid indir len 0x%x, "
 				    "driver confused?\r\n",
 				    name, (u_int)vdir->len);
 				return -1;
@@ -503,8 +513,7 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 			for (;;) {
 				vp = &vindir[next];
 				if (vp->flags & VRING_DESC_F_INDIRECT) {
-					fprintf(stderr,
-					    "%s: indirect desc has INDIR flag,"
+					pr_err("%s: indirect desc has INDIR flag,"
 					    " driver confused?\r\n",
 					    name);
 					return -1;
@@ -516,8 +525,7 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 					break;
 				next = vp->next;
 				if (next >= n_indir) {
-					fprintf(stderr,
-					    "%s: invalid next %u > %u, "
+					pr_err("%s: invalid next %u > %u, "
 					    "driver confused?\r\n",
 					    name, (u_int)next, n_indir);
 					return -1;
@@ -528,8 +536,7 @@ vq_getchain(struct virtio_vq_info *vq, uint16_t *pidx,
 			return i;
 	}
 loopy:
-	fprintf(stderr,
-	    "%s: descriptor loop? count > %d - driver confused?\r\n",
+	pr_err("%s: descriptor loop? count > %d - driver confused?\r\n",
 	    name, i);
 	return -1;
 }
@@ -611,6 +618,9 @@ vq_endchains(struct virtio_vq_info *vq, int used_all_avail)
 	 * In any case, though, if NOTIFY_ON_EMPTY is set and the
 	 * entire avail was processed, we need to interrupt always.
 	 */
+
+	atomic_thread_fence();
+
 	base = vq->base;
 	old_idx = vq->save_used;
 	vq->save_used = new_idx = vq->used->idx;
@@ -755,8 +765,6 @@ virtio_pci_legacy_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	uint32_t value;
 	int error;
 
-	/* XXX probably should do something better than just assert() */
-	assert(baridx == base->legacy_pio_bar_idx);
 
 	if (base->mtx)
 		pthread_mutex_lock(base->mtx);
@@ -794,12 +802,10 @@ bad:
 	if (cr == NULL || cr->size != size) {
 		if (cr != NULL) {
 			/* offset must be OK, so size must be bad */
-			fprintf(stderr,
-			    "%s: read from %s: bad size %d\r\n",
+			pr_err("%s: read from %s: bad size %d\r\n",
 			    name, cr->name, size);
 		} else {
-			fprintf(stderr,
-			    "%s: read from bad offset/size %jd/%d\r\n",
+			pr_err("%s: read from bad offset/size %jd/%d\r\n",
 			    name, (uintmax_t)offset, size);
 		}
 		goto done;
@@ -869,8 +875,6 @@ virtio_pci_legacy_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	uint32_t newoff;
 	int error;
 
-	/* XXX probably should do something better than just assert() */
-	assert(baridx == base->legacy_pio_bar_idx);
 
 	if (base->mtx)
 		pthread_mutex_lock(base->mtx);
@@ -907,16 +911,13 @@ bad:
 		if (cr != NULL) {
 			/* offset must be OK, wrong size and/or reg is R/O */
 			if (cr->size != size)
-				fprintf(stderr,
-				    "%s: write to %s: bad size %d\r\n",
+				pr_err("%s: write to %s: bad size %d\r\n",
 				    name, cr->name, size);
 			if (cr->ro)
-				fprintf(stderr,
-				    "%s: write to read-only reg %s\r\n",
+				pr_err("%s: write to read-only reg %s\r\n",
 				    name, cr->name);
 		} else {
-			fprintf(stderr,
-			    "%s: write to bad offset/size %jd/%d\r\n",
+			pr_err("%s: write to bad offset/size %jd/%d\r\n",
 			    name, (uintmax_t)offset, size);
 		}
 		goto done;
@@ -944,7 +945,7 @@ bad:
 		break;
 	case VIRTIO_PCI_QUEUE_NOTIFY:
 		if (value >= vops->nvq) {
-			fprintf(stderr, "%s: queue %d notify out of range\r\n",
+			pr_err("%s: queue %d notify out of range\r\n",
 				name, (int)value);
 			goto done;
 		}
@@ -954,8 +955,7 @@ bad:
 		else if (vops->qnotify)
 			(*vops->qnotify)(DEV_STRUCT(base), vq);
 		else
-			fprintf(stderr,
-			    "%s: qnotify queue %d: missing vq/vops notify\r\n",
+			pr_err("%s: qnotify queue %d: missing vq/vops notify\r\n",
 				name, (int)value);
 		break;
 	case VIRTIO_PCI_STATUS:
@@ -989,8 +989,7 @@ bad:
 	goto done;
 
 bad_qindex:
-	fprintf(stderr,
-	    "%s: write config reg %s: curq %d >= max %d\r\n",
+	pr_err("%s: write config reg %s: curq %d >= max %d\r\n",
 	    name, cr->name, base->curq, vops->nvq);
 done:
 	if (base->mtx)
@@ -1050,8 +1049,7 @@ virtio_set_modern_mmio_bar(struct virtio_base *base, int barnum)
 	vops = base->vops;
 
 	if (vops->cfgsize > VIRTIO_CAP_DEVICE_SIZE) {
-		fprintf(stderr,
-			"%s: cfgsize %lu > max %d\r\n",
+		pr_err("%s: cfgsize %lu > max %d\r\n",
 			vops->name, vops->cfgsize, VIRTIO_CAP_DEVICE_SIZE);
 		return -1;
 	}
@@ -1061,40 +1059,57 @@ virtio_set_modern_mmio_bar(struct virtio_base *base, int barnum)
 	cap.offset = VIRTIO_CAP_COMMON_OFFSET;
 	cap.length = VIRTIO_CAP_COMMON_SIZE;
 	rc = pci_emul_add_capability(base->dev, (u_char *)&cap, sizeof(cap));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add common configuration capability failed\n");
+		return -1;
+	}
 
 	/* isr status capability */
 	cap.cfg_type = VIRTIO_PCI_CAP_ISR_CFG;
 	cap.offset = VIRTIO_CAP_ISR_OFFSET;
 	cap.length = VIRTIO_CAP_ISR_SIZE;
 	rc = pci_emul_add_capability(base->dev, (u_char *)&cap, sizeof(cap));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add isr status capability failed\n");
+		return -1;
+	}
 
 	/* device specific configuration capability */
 	cap.cfg_type = VIRTIO_PCI_CAP_DEVICE_CFG;
 	cap.offset = VIRTIO_CAP_DEVICE_OFFSET;
 	cap.length = VIRTIO_CAP_DEVICE_SIZE;
 	rc = pci_emul_add_capability(base->dev, (u_char *)&cap, sizeof(cap));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add device specific configuration capability failed\n");
+		return -1;
+	}
 
 	/* notification capability */
 	rc = pci_emul_add_capability(base->dev, (u_char *)&notify,
 		sizeof(notify));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add notification capability failed\n");
+		return -1;
+	}
 
 	/* pci alternative configuration access capability */
 	rc = pci_emul_add_capability(base->dev, (u_char *)&cfg, sizeof(cfg));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add alternative configuration access capability failed\n");
+		return -1;
+	}
 
 	/* allocate and register modern memory bar */
 	rc = pci_emul_alloc_bar(base->dev, barnum, PCIBAR_MEM64,
 				VIRTIO_MODERN_MEM_BAR_SIZE);
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("allocate and register modern memory bar failed\n");
+		return -1;
+	}
 
 	base->cfg_coff = virtio_find_capability(base, VIRTIO_PCI_CAP_PCI_CFG);
 	if (base->cfg_coff < 0) {
-		fprintf(stderr,
-			"%s: VIRTIO_PCI_CAP_PCI_CFG not found\r\n",
+		pr_err("%s: VIRTIO_PCI_CAP_PCI_CFG not found\r\n",
 			vops->name);
 		return -1;
 	}
@@ -1124,11 +1139,17 @@ virtio_set_modern_pio_bar(struct virtio_base *base, int barnum)
 	/* notification capability */
 	rc = pci_emul_add_capability(base->dev, (u_char *)&notify_pio,
 		sizeof(notify_pio));
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("pci emulation add notification capability for virtio modern PIO BAR failed\n");
+		return -1;
+	}
 
 	/* allocate and register modern pio bar */
 	rc = pci_emul_alloc_bar(base->dev, barnum, PCIBAR_IO, 4);
-	assert(rc == 0);
+	if (rc != 0) {
+		pr_err("allocate and register modern pio bar failed\n");
+		return -1;
+	}
 
 	base->modern_pio_bar_idx = barnum;
 	return 0;
@@ -1165,30 +1186,6 @@ virtio_set_modern_bar(struct virtio_base *base, bool use_notify_pio)
 			VIRTIO_MODERN_MMIO_BAR_IDX);
 
 	return rc;
-}
-
-/**
- * @brief Indicate the device has experienced an error.
- *
- * This is called when the device has experienced an error from which it
- * cannot re-cover. DEVICE_NEEDS_RESET is set to the device status register
- * and a config change intr is sent to the guest driver.
- *
- * @param base Pointer to struct virtio_base.
- *
- * @return None
- */
-void
-virtio_dev_error(struct virtio_base *base)
-{
-	if (base->negotiated_caps & (1UL << VIRTIO_F_VERSION_1)) {
-		/* see 2.1.2. if DRIVER_OK is set, need to send
-		 * a device configuration change notification to the driver
-		 */
-		base->status |= VIRTIO_CONFIG_S_NEEDS_RESET;
-		if (base->status & VIRTIO_CONFIG_S_DRIVER_OK)
-			virtio_config_changed(base);
-	}
 }
 
 static struct cap_region {
@@ -1238,12 +1235,10 @@ virtio_common_cfg_read(struct pci_vdev *dev, uint64_t offset, int size)
 	if (cr == NULL || cr->size != size) {
 		if (cr != NULL) {
 			/* offset must be OK, so size must be bad */
-			fprintf(stderr,
-				"%s: read from %s: bad size %d\r\n",
+			pr_err("%s: read from %s: bad size %d\r\n",
 				name, cr->name, size);
 		} else {
-			fprintf(stderr,
-				"%s: read from bad offset/size %jd/%d\r\n",
+			pr_err("%s: read from bad offset/size %jd/%d\r\n",
 				name, (uintmax_t)offset, size);
 		}
 
@@ -1355,16 +1350,13 @@ virtio_common_cfg_write(struct pci_vdev *dev, uint64_t offset, int size,
 		if (cr != NULL) {
 			/* offset must be OK, wrong size and/or reg is R/O */
 			if (cr->size != size)
-				fprintf(stderr,
-					"%s: write to %s: bad size %d\r\n",
+				pr_err("%s: write to %s: bad size %d\r\n",
 					name, cr->name, size);
 			if (cr->ro)
-				fprintf(stderr,
-					"%s: write to read-only reg %s\r\n",
+				pr_err("%s: write to read-only reg %s\r\n",
 					name, cr->name);
 		} else {
-			fprintf(stderr,
-				"%s: write to bad offset/size %jd/%d\r\n",
+			pr_err("%s: write to bad offset/size %jd/%d\r\n",
 				name, (uintmax_t)offset, size);
 		}
 
@@ -1468,8 +1460,7 @@ virtio_common_cfg_write(struct pci_vdev *dev, uint64_t offset, int size,
 	return;
 
 bad_qindex:
-	fprintf(stderr,
-		"%s: write config reg %s: curq %d >= max %d\r\n",
+	pr_err("%s: write config reg %s: curq %d >= max %d\r\n",
 		name, cr->name, base->curq, vops->nvq);
 }
 
@@ -1504,16 +1495,14 @@ virtio_device_cfg_read(struct pci_vdev *dev, uint64_t offset, int size)
 	max = vops->cfgsize ? vops->cfgsize : 0x100000000;
 
 	if (offset + size > max) {
-		fprintf(stderr,
-			"%s: reading from 0x%lx size %d exceeds limit\r\n",
+		pr_err("%s: reading from 0x%lx size %d exceeds limit\r\n",
 			name, offset, size);
 		return value;
 	}
 
 	error = (*vops->cfgread)(DEV_STRUCT(base), offset, size, &value);
 	if (error) {
-		fprintf(stderr,
-			"%s: reading from 0x%lx size %d failed %d\r\n",
+		pr_err("%s: reading from 0x%lx size %d failed %d\r\n",
 			name, offset, size, error);
 		value = size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffff;
 	}
@@ -1536,16 +1525,14 @@ virtio_device_cfg_write(struct pci_vdev *dev, uint64_t offset, int size,
 	max = vops->cfgsize ? vops->cfgsize : 0x100000000;
 
 	if (offset + size > max) {
-		fprintf(stderr,
-			"%s: writing to 0x%lx size %d exceeds limit\r\n",
+		pr_err("%s: writing to 0x%lx size %d exceeds limit\r\n",
 			name, offset, size);
 		return;
 	}
 
 	error = (*vops->cfgwrite)(DEV_STRUCT(base), offset, size, value);
 	if (error)
-		fprintf(stderr,
-			"%s: writing ot 0x%lx size %d failed %d\r\n",
+		pr_err("%s: writing ot 0x%lx size %d failed %d\r\n",
 			name, offset, size, error);
 }
 
@@ -1568,8 +1555,7 @@ virtio_notify_cfg_write(struct pci_vdev *dev, uint64_t offset, int size,
 	name = vops->name;
 
 	if (idx >= vops->nvq) {
-		fprintf(stderr,
-			"%s: queue %lu notify out of range\r\n", name, idx);
+		pr_err("%s: queue %lu notify out of range\r\n", name, idx);
 		return;
 	}
 
@@ -1579,8 +1565,7 @@ virtio_notify_cfg_write(struct pci_vdev *dev, uint64_t offset, int size,
 	else if (vops->qnotify)
 		(*vops->qnotify)(DEV_STRUCT(base), vq);
 	else
-		fprintf(stderr,
-			"%s: qnotify queue %lu: missing vq/vops notify\r\n",
+		pr_err("%s: qnotify queue %lu: missing vq/vops notify\r\n",
 			name, idx);
 }
 
@@ -1594,23 +1579,20 @@ virtio_pci_modern_mmio_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	uint32_t value;
 	int capid;
 
-	assert(base->modern_mmio_bar_idx == baridx);
 
 	vops = base->vops;
 	name = vops->name;
 	value = size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffff;
 
 	if (size != 1 && size != 2 && size != 4) {
-		fprintf(stderr,
-			"%s: read from [%d:0x%lx] bad size %d\r\n",
+		pr_err("%s: read from [%d:0x%lx] bad size %d\r\n",
 			name, baridx, offset, size);
 		return value;
 	}
 
 	capid = virtio_get_cap_id(offset, size);
 	if (capid < 0) {
-		fprintf(stderr,
-			"%s: read from [%d:0x%lx] bad range %d\r\n",
+		pr_err("%s: read from [%d:0x%lx] bad range %d\r\n",
 			name, baridx, offset, size);
 		return value;
 	}
@@ -1632,8 +1614,7 @@ virtio_pci_modern_mmio_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		value = virtio_device_cfg_read(dev, offset, size);
 		break;
 	default: /* guest driver should not read from notify region */
-		fprintf(stderr,
-			"%s: read from [%d:0x%lx] size %d not supported\r\n",
+		pr_err("%s: read from [%d:0x%lx] size %d not supported\r\n",
 			name, baridx, offset, size);
 	}
 
@@ -1652,22 +1633,19 @@ virtio_pci_modern_mmio_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	const char *name;
 	int capid;
 
-	assert(base->modern_mmio_bar_idx == baridx);
 
 	vops = base->vops;
 	name = vops->name;
 
 	if (size != 1 && size != 2 && size != 4) {
-		fprintf(stderr,
-			"%s: write to [%d:0x%lx] bad size %d\r\n",
+		pr_err("%s: write to [%d:0x%lx] bad size %d\r\n",
 			name, baridx, offset, size);
 		return;
 	}
 
 	capid = virtio_get_cap_id(offset, size);
 	if (capid < 0) {
-		fprintf(stderr,
-			"%s: write to [%d:0x%lx] bad range %d\r\n",
+		pr_err("%s: write to [%d:0x%lx] bad range %d\r\n",
 			name, baridx, offset, size);
 		return;
 	}
@@ -1689,8 +1667,7 @@ virtio_pci_modern_mmio_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		virtio_notify_cfg_write(dev, offset, size, value);
 		break;
 	default: /* guest driver should not write to ISR region */
-		fprintf(stderr,
-			"%s: write to [%d:0x%lx] size %d not supported\r\n",
+		pr_err("%s: write to [%d:0x%lx] size %d not supported\r\n",
 			name, baridx, offset, size);
 	}
 
@@ -1702,9 +1679,6 @@ static uint32_t
 virtio_pci_modern_pio_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 			   int baridx, uint64_t offset, int size)
 {
-	struct virtio_base *base = dev->arg;
-
-	assert(base->modern_pio_bar_idx == baridx);
 	/* guest driver should not read notify pio */
 	return 0;
 }
@@ -1720,22 +1694,19 @@ virtio_pci_modern_pio_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	const char *name;
 	uint64_t idx;
 
-	assert(base->modern_pio_bar_idx == baridx);
 
 	vops = base->vops;
 	name = vops->name;
 	idx = value;
 
 	if (size != 1 && size != 2 && size != 4) {
-		fprintf(stderr,
-			"%s: write to [%d:0x%lx] bad size %d\r\n",
+		pr_err("%s: write to [%d:0x%lx] bad size %d\r\n",
 			name, baridx, offset, size);
 		return;
 	}
 
 	if (idx >= vops->nvq) {
-		fprintf(stderr,
-			"%s: queue %lu notify out of range\r\n", name, idx);
+		pr_err("%s: queue %lu notify out of range\r\n", name, idx);
 		return;
 	}
 
@@ -1748,8 +1719,7 @@ virtio_pci_modern_pio_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 	else if (vops->qnotify)
 		(*vops->qnotify)(DEV_STRUCT(base), vq);
 	else
-		fprintf(stderr,
-			"%s: qnotify queue %lu: missing vq/vops notify\r\n",
+		pr_err("%s: qnotify queue %lu: missing vq/vops notify\r\n",
 			name, idx);
 
 	if (base->mtx)
@@ -1796,7 +1766,7 @@ virtio_pci_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		return virtio_pci_modern_pio_read(ctx, vcpu, dev, baridx,
 			offset, size);
 
-	fprintf(stderr, "%s: read unexpected baridx %d\r\n",
+	pr_err("%s: read unexpected baridx %d\r\n",
 		base->vops->name, baridx);
 	return size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffff;
 }
@@ -1849,133 +1819,8 @@ virtio_pci_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		return;
 	}
 
-	fprintf(stderr, "%s: write unexpected baridx %d\r\n",
+	pr_err("%s: write unexpected baridx %d\r\n",
 		base->vops->name, baridx);
-}
-
-/**
- * @brief Handle PCI configuration space reads.
- *
- * Handle virtio PCI configuration space reads. Only the specific registers
- * that need speical operation are handled in this callback. For others just
- * fallback to pci core. This interface is only valid for virtio modern.
- *
- * @param ctx Pointer to struct vmctx representing VM context.
- * @param vcpu VCPU ID.
- * @param dev Pointer to struct pci_vdev which emulates a PCI device.
- * @param coff Register offset in bytes within PCI configuration space.
- * @param bytes Access range in bytes.
- * @param rv The value returned as read.
- *
- * @return 0 on handled and non-zero on non-handled.
- */
-int
-virtio_pci_modern_cfgread(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
-			  int coff, int bytes, uint32_t *rv)
-{
-	struct virtio_base *base = dev->arg;
-	struct virtio_pci_cfg_cap *cfg;
-	uint32_t value;
-	int cfg_coff = base->cfg_coff;
-	size_t cfg_data_offset;
-
-	cfg_data_offset = offsetof(struct virtio_pci_cfg_cap, pci_cfg_data);
-
-	/* we only need to handle the read to
-	 * virtio_pci_cfg_cap.pci_cfg_data[]
-	 * fallback for anything else by return -1
-	 */
-	if ((cfg_coff > 0) && (coff >= cfg_coff + cfg_data_offset) &&
-		(coff + bytes <= cfg_coff + sizeof(*cfg))) {
-		cfg = (struct virtio_pci_cfg_cap *)&dev->cfgdata[cfg_coff];
-		if (cfg->cap.bar == base->modern_pio_bar_idx)
-			value = virtio_pci_modern_pio_read(ctx, vcpu, dev,
-				cfg->cap.bar, cfg->cap.offset, cfg->cap.length);
-		else if (cfg->cap.bar == base->modern_mmio_bar_idx)
-			value = virtio_pci_modern_mmio_read(ctx, vcpu, dev,
-				cfg->cap.bar, cfg->cap.offset, cfg->cap.length);
-		else {
-			fprintf(stderr, "%s: cfgread unexpected baridx %d\r\n",
-				base->vops->name, cfg->cap.bar);
-			value = 0;
-		}
-
-		/* update pci_cfg_data */
-		if (cfg->cap.length == 1)
-			pci_set_cfgdata8(dev, cfg_coff + cfg_data_offset,
-				value);
-		else if (cfg->cap.length == 2)
-			pci_set_cfgdata16(dev, cfg_coff + cfg_data_offset,
-				value);
-		else
-			pci_set_cfgdata32(dev, cfg_coff + cfg_data_offset,
-				value);
-
-		*rv = value;
-		return 0;
-	}
-
-	return -1;
-}
-
-/**
- * @brief Handle PCI configuration space writes.
- *
- * Handle virtio PCI configuration space writes. Only the specific registers
- * that need speical operation are handled in this callback. For others just
- * fallback to pci core. This interface is only valid for virtio modern.
- *
- * @param ctx Pointer to struct vmctx representing VM context.
- * @param vcpu VCPU ID.
- * @param dev Pointer to struct pci_vdev which emulates a PCI device.
- * @param coff Register offset in bytes within PCI configuration space.
- * @param bytes Access range in bytes.
- * @param val The value to write.
- *
- * @return 0 on handled and non-zero on non-handled.
- */
-int
-virtio_pci_modern_cfgwrite(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
-			   int coff, int bytes, uint32_t val)
-{
-	struct virtio_base *base = dev->arg;
-	struct virtio_pci_cfg_cap *cfg;
-	int cfg_coff = base->cfg_coff;
-	size_t cfg_data_offset;
-
-	cfg_data_offset = offsetof(struct virtio_pci_cfg_cap, pci_cfg_data);
-
-	/* we only need to handle the write to
-	 * virtio_pci_cfg_cap.pci_cfg_data[]
-	 * fallback for anything else by return -1
-	 */
-	if ((cfg_coff > 0) && (coff >= cfg_coff + cfg_data_offset) &&
-		(coff + bytes <= cfg_coff + sizeof(*cfg))) {
-		/* default cfg write */
-		if (bytes == 1)
-			pci_set_cfgdata8(dev, coff, val);
-		else if (bytes == 2)
-			pci_set_cfgdata16(dev, coff, val);
-		else
-			pci_set_cfgdata32(dev, coff, val);
-
-		cfg = (struct virtio_pci_cfg_cap *)&dev->cfgdata[cfg_coff];
-		if (cfg->cap.bar == base->modern_pio_bar_idx)
-			virtio_pci_modern_pio_write(ctx, vcpu, dev,
-				cfg->cap.bar, cfg->cap.offset,
-				cfg->cap.length, val);
-		else if (cfg->cap.bar == base->modern_mmio_bar_idx)
-			virtio_pci_modern_mmio_write(ctx, vcpu, dev,
-				cfg->cap.bar, cfg->cap.offset,
-				cfg->cap.length, val);
-		else
-			fprintf(stderr, "%s: cfgwrite unexpected baridx %d\r\n",
-				base->vops->name, cfg->cap.bar);
-
-		return 0;
-	}
-
-	return -1;
 }
 
 /**

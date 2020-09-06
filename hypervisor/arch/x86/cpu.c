@@ -4,70 +4,86 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
-#include <acpi.h>
-#include <schedule.h>
-#include <version.h>
-#include <trampoline.h>
+#include <types.h>
+#include <bits.h>
+#include <page.h>
 #include <e820.h>
+#include <mmu.h>
+#include <vtd.h>
+#include <lapic.h>
+#include <per_cpu.h>
+#include <cpufeatures.h>
 #include <cpu_caps.h>
-#include <security.h>
+#include <acpi.h>
+#include <ioapic.h>
+#include <trampoline.h>
+#include <cpuid.h>
+#include <version.h>
+#include <vmx.h>
+#include <msr.h>
+#include <ptdev.h>
+#include <logmsg.h>
+#include <rdt.h>
+#include <vboot.h>
+#include <sgx.h>
+#include <uart16550.h>
+#include <ivshmem.h>
 
-struct per_cpu_region per_cpu_data[CONFIG_MAX_PCPU_NUM] __aligned(PAGE_SIZE);
+#define CPU_UP_TIMEOUT		100U /* millisecond */
+#define CPU_DOWN_TIMEOUT	100U /* millisecond */
+
+struct per_cpu_region per_cpu_data[MAX_PCPU_NUM] __aligned(PAGE_SIZE);
 static uint16_t phys_cpu_num = 0U;
 static uint64_t pcpu_sync = 0UL;
-static uint16_t up_count = 0U;
 static uint64_t startup_paddr = 0UL;
 
 /* physical cpu active bitmap, support up to 64 cpus */
-static uint64_t pcpu_active_bitmap = 0UL;
+static volatile uint64_t pcpu_active_bitmap = 0UL;
 
-static void cpu_xsave_init(void);
-static void set_current_cpu_id(uint16_t pcpu_id);
+static void init_pcpu_xsave(void);
+static void set_current_pcpu_id(uint16_t pcpu_id);
 static void print_hv_banner(void);
-static uint16_t get_cpu_id_from_lapic_id(uint32_t lapic_id);
+static uint16_t get_pcpu_id_from_lapic_id(uint32_t lapic_id);
 static uint64_t start_tsc __attribute__((__section__(".bss_noinit")));
 
-static void init_percpu_lapic_id(void)
+/**
+ * @pre phys_cpu_num <= MAX_PCPU_NUM
+ */
+static bool init_percpu_lapic_id(void)
 {
 	uint16_t i;
-	uint16_t pcpu_num;
-	uint32_t lapic_id_array[CONFIG_MAX_PCPU_NUM];
+	uint32_t lapic_id_array[MAX_PCPU_NUM];
+	bool success = false;
 
 	/* Save all lapic_id detected via parse_mdt in lapic_id_array */
-	pcpu_num = parse_madt(lapic_id_array);
-	if (pcpu_num == 0U) {
-		/* failed to get the physcial cpu number */
-		ASSERT(false);
+	phys_cpu_num = parse_madt(lapic_id_array);
+
+	if ((phys_cpu_num != 0U) && (phys_cpu_num <= MAX_PCPU_NUM)) {
+		for (i = 0U; i < phys_cpu_num; i++) {
+			per_cpu(lapic_id, i) = lapic_id_array[i];
+		}
+		success = true;
 	}
 
-	phys_cpu_num = pcpu_num;
-
-	for (i = 0U; (i < pcpu_num) && (i < CONFIG_MAX_PCPU_NUM); i++) {
-		per_cpu(lapic_id, i) = lapic_id_array[i];
-	}
+	return success;
 }
 
-static void cpu_set_current_state(uint16_t pcpu_id, enum pcpu_boot_state state)
+static void pcpu_set_current_state(uint16_t pcpu_id, enum pcpu_boot_state state)
 {
 	/* Check if state is initializing */
 	if (state == PCPU_STATE_INITIALIZING) {
-		/* Increment CPU up count */
-		atomic_inc16(&up_count);
 
 		/* Save this CPU's logical ID to the TSC AUX MSR */
-		set_current_cpu_id(pcpu_id);
-	}
-
-	/* If cpu is dead, decrement CPU up count */
-	if (state == PCPU_STATE_DEAD) {
-		atomic_dec16(&up_count);
+		set_current_pcpu_id(pcpu_id);
 	}
 
 	/* Set state for the specified CPU */
 	per_cpu(boot_state, pcpu_id) = state;
 }
 
+/*
+ * @post return <= MAX_PCPU_NUM
+ */
 uint16_t get_pcpu_nums(void)
 {
 	return phys_cpu_num;
@@ -83,38 +99,85 @@ uint64_t get_active_pcpu_bitmap(void)
 	return pcpu_active_bitmap;
 }
 
-void init_cpu_pre(uint16_t pcpu_id_args)
+static void enable_ac_for_splitlock(void)
 {
-	uint16_t pcpu_id = pcpu_id_args;
+#ifndef CONFIG_ENFORCE_TURNOFF_AC
+	uint64_t test_ctl;
 
-	if (pcpu_id == BOOT_CPU_ID) {
+	if (has_core_cap(1U << 5U)) {
+		test_ctl = msr_read(MSR_TEST_CTL);
+		test_ctl |= (1U << 29U);
+		msr_write(MSR_TEST_CTL, test_ctl);
+	}
+#endif /*CONFIG_ENFORCE_TURNOFF_AC*/
+}
+
+void init_pcpu_pre(bool is_bsp)
+{
+	uint16_t pcpu_id;
+	int32_t ret;
+
+	if (is_bsp) {
+		pcpu_id = BSP_CPU_ID;
 		start_tsc = rdtsc();
-
-		/* Clear BSS */
-		(void)memset(&ld_bss_start, 0U,
-				(size_t)(&ld_bss_end - &ld_bss_start));
 
 		/* Get CPU capabilities thru CPUID, including the physical address bit
 		 * limit which is required for initializing paging.
 		 */
-		init_cpu_capabilities();
+		init_pcpu_capabilities();
 
-		init_cpu_model_name();
+		if (detect_hardware_support() != 0) {
+			panic("hardware not support!");
+		}
 
-		load_cpu_state_data();
+		if (sanitize_multiboot_info() != 0) {
+			panic("Multiboot info error!");
+		}
+
+		init_pcpu_model_name();
+
+		load_pcpu_state_data();
 
 		/* Initialize the hypervisor paging */
 		init_e820();
 		init_paging();
 
-		if (!cpu_has_cap(X86_FEATURE_X2APIC)) {
-			panic("x2APIC is not present!");
-		}
+		/*
+		 * Need update uart_base_address here for vaddr2paddr mapping may changed
+		 * WARNNING: DO NOT CALL PRINTF BETWEEN ENABLE PAGING IN init_paging AND HERE!
+		 */
+		uart16550_init(false);
 
 		early_init_lapic();
 
-		init_percpu_lapic_id();
+		init_vboot();
+#ifdef CONFIG_ACPI_PARSE_ENABLED
+		ret = acpi_fixup();
+		if (ret != 0) {
+			panic("failed to parse/fix up ACPI table!");
+		}
+#endif
+
+		if (!init_percpu_lapic_id()) {
+			panic("failed to init_percpu_lapic_id!");
+		}
+
+		ret = init_ioapic_id_info();
+		if (ret != 0) {
+			panic("System IOAPIC info is incorrect!");
+		}
+
+#ifdef CONFIG_RDT_ENABLED
+		init_rdt_info();
+#endif
+
+		/* NOTE: this must call after MMCONFIG is parsed in init_vboot and before APs are INIT.
+		 * We only support platform with MMIO based CFG space access.
+		 * IO port access only support in debug version.
+		 */
+		pci_switch_to_mmio_cfg_ops();
 	} else {
+
 		/* Switch this CPU to use the same page tables set-up by the
 		 * primary/boot CPU
 		 */
@@ -122,54 +185,47 @@ void init_cpu_pre(uint16_t pcpu_id_args)
 
 		early_init_lapic();
 
-		pcpu_id = get_cpu_id_from_lapic_id(get_cur_lapic_id());
-		if (pcpu_id >= CONFIG_MAX_PCPU_NUM) {
+		pcpu_id = get_pcpu_id_from_lapic_id(get_cur_lapic_id());
+		if (pcpu_id >= MAX_PCPU_NUM) {
 			panic("Invalid pCPU ID!");
 		}
 	}
 
-	bitmap_set_nolock(pcpu_id, &pcpu_active_bitmap);
+	bitmap_set_lock(pcpu_id, &pcpu_active_bitmap);
 
 	/* Set state for this CPU to initializing */
-	cpu_set_current_state(pcpu_id, PCPU_STATE_INITIALIZING);
+	pcpu_set_current_state(pcpu_id, PCPU_STATE_INITIALIZING);
 }
 
-void init_cpu_post(uint16_t pcpu_id)
+void init_pcpu_post(uint16_t pcpu_id)
 {
 #ifdef STACK_PROTECTOR
 	set_fs_base();
 #endif
 	load_gdtr_and_tr();
 
-	enable_smep();
+	enable_ac_for_splitlock();
 
-	enable_smap();
+	init_pcpu_xsave();
 
-	cpu_xsave_init();
-
-	if (pcpu_id == BOOT_CPU_ID) {
+	if (pcpu_id == BSP_CPU_ID) {
 		/* Print Hypervisor Banner */
 		print_hv_banner();
 
 		/* Calibrate TSC Frequency */
 		calibrate_tsc();
 
-		pr_acrnlog("HV version %s-%s-%s %s (daily tag:%s) build by %s, start time %lluus",
+		pr_acrnlog("HV version %s-%s-%s %s (daily tag:%s) %s@%s build by %s%s, start time %luus",
 				HV_FULL_VERSION,
 				HV_BUILD_TIME, HV_BUILD_VERSION, HV_BUILD_TYPE,
-				HV_DAILY_TAG,
-				HV_BUILD_USER, ticks_to_us(start_tsc));
+				HV_DAILY_TAG, HV_BUILD_SCENARIO, HV_BUILD_BOARD,
+				HV_BUILD_USER, HV_CONFIG_TOOL, ticks_to_us(start_tsc));
 
-		pr_acrnlog("API version %u.%u",
-				HV_API_MAJOR_VERSION, HV_API_MINOR_VERSION);
+		pr_acrnlog("API version %u.%u",	HV_API_MAJOR_VERSION, HV_API_MINOR_VERSION);
 
-		pr_acrnlog("Detect processor: %s", (get_cpu_info())->model_name);
+		pr_acrnlog("Detect processor: %s", (get_pcpu_info())->model_name);
 
-		pr_dbg("Core %hu is up", BOOT_CPU_ID);
-
-		if (detect_hardware_support() != 0) {
-			panic("hardware not support!");
-		}
+		pr_dbg("Core %hu is up", BSP_CPU_ID);
 
 		/* Warn for security feature not ready */
 		if (!check_cpu_security_cap()) {
@@ -177,39 +233,73 @@ void init_cpu_post(uint16_t pcpu_id)
 			pr_fatal("Please apply the latest CPU uCode patch!");
 		}
 
-		init_scheduler();
-
 		/* Initialize interrupts */
-		interrupt_init(BOOT_CPU_ID);
+		init_interrupt(BSP_CPU_ID);
 
 		timer_init();
 		setup_notification();
-		setup_posted_intr_notification();
+		setup_pi_notification();
 
+		if (init_iommu() != 0) {
+			panic("failed to initialize iommu!");
+		}
+
+		hv_access_memory_region_update(get_mmcfg_base(), PCI_MMCONFIG_SIZE);
+#ifdef CONFIG_IVSHMEM_ENABLED
+		init_ivshmem_shared_memory();
+#endif
+		init_pci_pdev_list(); /* init_iommu must come before this */
+		ptdev_init();
+
+		if (init_sgx() != 0) {
+			panic("failed to initialize sgx!");
+		}
+
+		/*
+		 * Reserve memory from platform E820 for EPT 4K pages for all VMs
+		 */
+#ifdef CONFIG_LAST_LEVEL_EPT_AT_BOOT
+		reserve_buffer_for_ept_pages();
+#endif
 		/* Start all secondary cores */
 		startup_paddr = prepare_trampoline();
-		start_cpus();
+		if (!start_pcpus(AP_MASK)) {
+			panic("Failed to start all secondary cores!");
+		}
 
-		ASSERT(get_cpu_id() == BOOT_CPU_ID, "");
+		ASSERT(get_pcpu_id() == BSP_CPU_ID, "");
 	} else {
 		pr_dbg("Core %hu is up", pcpu_id);
 
+		pr_warn("Skipping VM configuration check which should be done before building HV binary.");
+
 		/* Initialize secondary processor interrupts. */
-		interrupt_init(pcpu_id);
+		init_interrupt(pcpu_id);
 
 		timer_init();
+		ptdev_init();
 
 		/* Wait for boot processor to signal all secondary cores to continue */
 		wait_sync_change(&pcpu_sync, 0UL);
 	}
+
+	init_sched(pcpu_id);
+
+#ifdef CONFIG_RDT_ENABLED
+	setup_clos(pcpu_id);
+#endif
+
+	enable_smep();
+
+	enable_smap();
 }
 
-static uint16_t get_cpu_id_from_lapic_id(uint32_t lapic_id)
+static uint16_t get_pcpu_id_from_lapic_id(uint32_t lapic_id)
 {
 	uint16_t i;
 	uint16_t pcpu_id = INVALID_CPU_ID;
 
-	for (i = 0U; (i < phys_cpu_num) && (i < CONFIG_MAX_PCPU_NUM); i++) {
+	for (i = 0U; i < phys_cpu_num; i++) {
 		if (per_cpu(lapic_id, i) == lapic_id) {
 			pcpu_id = i;
 			break;
@@ -219,7 +309,7 @@ static uint16_t get_cpu_id_from_lapic_id(uint32_t lapic_id)
 	return pcpu_id;
 }
 
-static void start_cpu(uint16_t pcpu_id)
+static void start_pcpu(uint16_t pcpu_id)
 {
 	uint32_t timeout;
 
@@ -228,12 +318,12 @@ static void start_cpu(uint16_t pcpu_id)
 	write_trampoline_stack_sym(pcpu_id);
 	clac();
 
-	send_startup_ipi(INTR_CPU_STARTUP_USE_DEST, pcpu_id, startup_paddr);
+	send_startup_ipi(pcpu_id, startup_paddr);
 
 	/* Wait until the pcpu with pcpu_id is running and set the active bitmap or
 	 * configured time-out has expired
 	 */
-	timeout = (uint32_t)CONFIG_CPU_UP_TIMEOUT * 1000U;
+	timeout = CPU_UP_TIMEOUT * 1000U;
 	while (!is_pcpu_active(pcpu_id) && (timeout != 0U)) {
 		/* Delay 10us */
 		udelay(10U);
@@ -244,74 +334,92 @@ static void start_cpu(uint16_t pcpu_id)
 
 	/* Check to see if expected CPU is actually up */
 	if (!is_pcpu_active(pcpu_id)) {
-		/* Print error */
-		pr_fatal("Secondary CPUs failed to come up");
-
-		/* Error condition - loop endlessly for now */
-		do {
-		} while (1);
+		pr_fatal("Secondary CPU%hu failed to come up", pcpu_id);
+		pcpu_set_current_state(pcpu_id, PCPU_STATE_DEAD);
 	}
 }
 
-void start_cpus(void)
+
+/**
+ * @brief Start all cpus if the bit is set in mask except itself
+ *
+ * @param[in] mask bits mask of cpus which should be started
+ *
+ * @return true if all cpus set in mask are started
+ * @return false if there are any cpus set in mask aren't started
+ */
+bool start_pcpus(uint64_t mask)
 {
 	uint16_t i;
+	uint16_t pcpu_id = get_pcpu_id();
+	uint64_t expected_start_mask = mask;
 
 	/* secondary cpu start up will wait for pcpu_sync -> 0UL */
-	atomic_store64(&pcpu_sync, 1UL);
+	pcpu_sync = 1UL;
+	cpu_write_memory_barrier();
 
-	for (i = 0U; i < phys_cpu_num; i++) {
-		if (get_cpu_id() == i) {
-			continue;
+	i = ffs64(expected_start_mask);
+	while (i != INVALID_BIT_INDEX) {
+		bitmap_clear_nolock(i, &expected_start_mask);
+
+		if (pcpu_id == i) {
+			continue; /* Avoid start itself */
 		}
 
-		start_cpu(i);
+		start_pcpu(i);
+		i = ffs64(expected_start_mask);
 	}
 
 	/* Trigger event to allow secondary CPUs to continue */
-	atomic_store64(&pcpu_sync, 0UL);
+	pcpu_sync = 0UL;
+
+	return ((pcpu_active_bitmap & mask) == mask);
 }
 
-void stop_cpus(void)
+void make_pcpu_offline(uint16_t pcpu_id)
 {
-	uint16_t pcpu_id, expected_up;
+	bitmap_set_lock(NEED_OFFLINE, &per_cpu(pcpu_flag, pcpu_id));
+	if (get_pcpu_id() != pcpu_id) {
+		send_single_ipi(pcpu_id, NOTIFY_VCPU_VECTOR);
+	}
+}
+
+bool need_offline(uint16_t pcpu_id)
+{
+	return bitmap_test_and_clear_lock(NEED_OFFLINE, &per_cpu(pcpu_flag, pcpu_id));
+}
+
+void wait_pcpus_offline(uint64_t mask)
+{
 	uint32_t timeout;
 
-	timeout = (uint32_t)CONFIG_CPU_UP_TIMEOUT * 1000U;
+	timeout = CPU_DOWN_TIMEOUT * 1000U;
+	while (((pcpu_active_bitmap & mask) != 0UL) && (timeout != 0U)) {
+		udelay(10U);
+		timeout -= 10U;
+	}
+}
+
+void stop_pcpus(void)
+{
+	uint16_t pcpu_id;
+	uint64_t mask = 0UL;
+
 	for (pcpu_id = 0U; pcpu_id < phys_cpu_num; pcpu_id++) {
-		if (get_cpu_id() == pcpu_id) {	/* avoid offline itself */
+		if (get_pcpu_id() == pcpu_id) {	/* avoid offline itself */
 			continue;
 		}
 
+		bitmap_set_nolock(pcpu_id, &mask);
 		make_pcpu_offline(pcpu_id);
 	}
 
-	expected_up = 1U;
-	while ((atomic_load16(&up_count) != expected_up) && (timeout != 0U)) {
-		/* Delay 10us */
-		udelay(10U);
-
-		/* Decrement timeout value */
-		timeout -= 10U;
-	}
-
-	if (atomic_load16(&up_count) != expected_up) {
-		pr_fatal("Can't make all APs offline");
-
-		/* if partial APs is down, it's not easy to recover
-		 * per our current implementation (need make up dead
-		 * APs one by one), just print error mesage and dead
-		 * loop here.
-		 *
-		 * FIXME:
-		 * We need to refine here to handle the AP offline
-		 * failure for release/debug version. Ideally, we should
-		 * define how to handle general unrecoverable error and
-		 * follow it here.
-		 */
-		do {
-		} while (1);
-	}
+	/**
+	 * Timeout never occurs here:
+	 *   If target cpu received a NMI and panic, it has called cpu_dead and make_pcpu_offline success.
+	 *   If target cpu is running, an IPI will be delivered to it and then call cpu_dead.
+	 */
+	wait_pcpus_offline(mask);
 }
 
 void cpu_do_idle(void)
@@ -328,15 +436,17 @@ void cpu_dead(void)
 	 * us to modify the value using a JTAG probe and resume if needed.
 	 */
 	int32_t halt = 1;
-	uint16_t pcpu_id = get_cpu_id();
+	uint16_t pcpu_id = get_pcpu_id();
 
-	if (bitmap_test_and_clear_lock(pcpu_id, &pcpu_active_bitmap)) {
+	deinit_sched(pcpu_id);
+	if (bitmap_test(pcpu_id, &pcpu_active_bitmap)) {
 		/* clean up native stuff */
 		vmx_off();
 		cache_flush_invalidate_all();
 
 		/* Set state to show CPU is dead */
-		cpu_set_current_state(pcpu_id, PCPU_STATE_DEAD);
+		pcpu_set_current_state(pcpu_id, PCPU_STATE_DEAD);
+		bitmap_clear_lock(pcpu_id, &pcpu_active_bitmap);
 
 		/* Halt the CPU */
 		do {
@@ -347,7 +457,7 @@ void cpu_dead(void)
 	}
 }
 
-static void set_current_cpu_id(uint16_t pcpu_id)
+static void set_current_pcpu_id(uint16_t pcpu_id)
 {
 	/* Write TSC AUX register */
 	msr_write(MSR_IA32_TSC_AUX, (uint64_t) pcpu_id);
@@ -361,54 +471,122 @@ static void print_hv_banner(void)
 	printf(boot_msg);
 }
 
+static
+inline void asm_monitor(volatile const uint64_t *addr, uint64_t ecx, uint64_t edx)
+{
+	asm volatile("monitor\n" : : "a" (addr), "c" (ecx), "d" (edx));
+}
+
+static
+inline void asm_mwait(uint64_t eax, uint64_t ecx)
+{
+	asm volatile("mwait\n" : : "a" (eax), "c" (ecx));
+}
+
 /* wait until *sync == wake_sync */
-void wait_sync_change(uint64_t *sync, uint64_t wake_sync)
+void wait_sync_change(volatile const uint64_t *sync, uint64_t wake_sync)
 {
 	if (has_monitor_cap()) {
 		/* Wait for the event to be set using monitor/mwait */
-		asm volatile ("1: cmpq      %%rbx,(%%rax)\n"
-			      "   je        2f\n"
-			      "   monitor\n"
-			      "   mwait\n"
-			      "   jmp       1b\n"
-			      "2:\n"
-			      :
-			      : "a" (sync), "d"(0), "c"(0),
-			      "b"(wake_sync)
-			      : "cc");
+		while ((*sync) != wake_sync) {
+			asm_monitor(sync, 0UL, 0UL);
+			if ((*sync) != wake_sync) {
+				asm_mwait(0UL, 0UL);
+			}
+		}
 	} else {
-		/* Wait for the event to be set using pause */
-		asm volatile ("1: cmpq      %%rbx,(%%rax)\n"
-			      "   je        2f\n"
-			      "   pause\n"
-			      "   jmp       1b\n"
-			      "2:\n"
-			      :
-			      : "a" (sync), "d"(0), "c"(0),
-			      "b"(wake_sync)
-			      : "cc");
+		while ((*sync) != wake_sync) {
+			asm_pause();
+		}
 	}
 }
 
-static void cpu_xsave_init(void)
+static void init_pcpu_xsave(void)
 {
 	uint64_t val64;
 	struct cpuinfo_x86 *cpu_info;
+	uint64_t xcr0, xss;
+	uint32_t eax, ecx, unused, xsave_area_size;
 
-	if (cpu_has_cap(X86_FEATURE_XSAVE)) {
-		CPU_CR_READ(cr4, &val64);
-		val64 |= CR4_OSXSAVE;
-		CPU_CR_WRITE(cr4, val64);
+	CPU_CR_READ(cr4, &val64);
+	val64 |= CR4_OSXSAVE;
+	CPU_CR_WRITE(cr4, val64);
 
-		if (get_cpu_id() == BOOT_CPU_ID) {
-			uint32_t ecx, unused;
-			cpuid(CPUID_FEATURES, &unused, &unused, &ecx, &unused);
+	if (get_pcpu_id() == BSP_CPU_ID) {
+		cpuid_subleaf(CPUID_FEATURES, 0x0U, &unused, &unused, &ecx, &unused);
 
-			/* if set, update it */
-			if ((ecx & CPUID_ECX_OSXSAVE) != 0U) {
-				cpu_info = get_cpu_info();
-				cpu_info->cpuid_leaves[FEAT_1_ECX] |= CPUID_ECX_OSXSAVE;
+		/* if set, update it */
+		if ((ecx & CPUID_ECX_OSXSAVE) != 0U) {
+			cpu_info = get_pcpu_info();
+			cpu_info->cpuid_leaves[FEAT_1_ECX] |= CPUID_ECX_OSXSAVE;
+
+			/* set xcr0 and xss with the componets bitmap get from cpuid */
+			xcr0 = ((uint64_t)cpu_info->cpuid_leaves[FEAT_D_0_EDX] << 32U)
+				+ cpu_info->cpuid_leaves[FEAT_D_0_EAX];
+			xss = ((uint64_t)cpu_info->cpuid_leaves[FEAT_D_1_EDX] << 32U)
+				+ cpu_info->cpuid_leaves[FEAT_D_1_ECX];
+			write_xcr(0, xcr0);
+			msr_write(MSR_IA32_XSS, xss);
+
+			/* get xsave area size, containing all the state components
+			 * corresponding to bits currently set in XCR0 | IA32_XSS */
+			cpuid_subleaf(CPUID_XSAVE_FEATURES, 1U,
+				&eax,
+				&xsave_area_size,
+				&ecx,
+				&unused);
+			if (xsave_area_size > XSAVE_STATE_AREA_SIZE) {
+				panic("XSAVE area (%d bytes) exceeds the pre-allocated 4K region\n",
+						xsave_area_size);
 			}
 		}
 	}
+}
+
+
+static void smpcall_write_msr_func(void *data)
+{
+	struct msr_data_struct *msr = (struct msr_data_struct *)data;
+
+	msr_write(msr->msr_index, msr->write_val);
+}
+
+void msr_write_pcpu(uint32_t msr_index, uint64_t value64, uint16_t pcpu_id)
+{
+	struct msr_data_struct msr = {0};
+	uint64_t mask = 0UL;
+
+	if (pcpu_id == get_pcpu_id()) {
+		msr_write(msr_index, value64);
+	} else {
+		msr.msr_index = msr_index;
+		msr.write_val = value64;
+		bitmap_set_nolock(pcpu_id, &mask);
+		smp_call_function(mask, smpcall_write_msr_func, &msr);
+	}
+}
+
+static void smpcall_read_msr_func(void *data)
+{
+	struct msr_data_struct *msr = (struct msr_data_struct *)data;
+
+	msr->read_val = msr_read(msr->msr_index);
+}
+
+uint64_t msr_read_pcpu(uint32_t msr_index, uint16_t pcpu_id)
+{
+	struct msr_data_struct msr = {0};
+	uint64_t mask = 0UL;
+	uint64_t ret = 0;
+
+	if (pcpu_id == get_pcpu_id()) {
+		ret = msr_read(msr_index);
+	} else {
+		msr.msr_index = msr_index;
+		bitmap_set_nolock(pcpu_id, &mask);
+		smp_call_function(mask, smpcall_read_msr_func, &msr);
+		ret = msr.read_val;
+	}
+
+	return ret;
 }

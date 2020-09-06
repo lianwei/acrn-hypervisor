@@ -7,6 +7,9 @@
 #ifndef INTR_LAPIC_H
 #define INTR_LAPIC_H
 
+#include <types.h>
+#include <apicreg.h>
+
 /* intr_lapic_icr_delivery_mode */
 #define INTR_LAPIC_ICR_FIXED    0x0U
 #define INTR_LAPIC_ICR_LP          0x1U
@@ -33,57 +36,106 @@
 #define INTR_LAPIC_ICR_ALL_INC_SELF         0x2U
 #define INTR_LAPIC_ICR_ALL_EX_SELF            0x3U
 
-/* LAPIC register bit and bitmask definitions */
-#define LAPIC_SVR_VECTOR                        0x000000FFU
-#define LAPIC_SVR_APIC_ENABLE_MASK                   0x00000100U
-
-#define LAPIC_LVT_MASK                          0x00010000U
-#define LAPIC_DELIVERY_MODE_EXTINT_MASK         0x00000700U
-
-/* LAPIC Timer bit and bitmask definitions */
-#define LAPIC_TMR_ONESHOT                       ((uint32_t) 0x0U << 17U)
-#define LAPIC_TMR_PERIODIC                      ((uint32_t) 0x1U << 17U)
-#define LAPIC_TMR_TSC_DEADLINE                  ((uint32_t) 0x2U << 17U)
-
 enum intr_cpu_startup_shorthand {
 	INTR_CPU_STARTUP_USE_DEST,
 	INTR_CPU_STARTUP_ALL_EX_SELF,
 	INTR_CPU_STARTUP_UNKNOWN,
 };
 
+/* x2APIC Interrupt Command Register (ICR) structure */
+union apic_icr {
+	uint64_t value;
+	struct {
+		uint32_t lo_32;
+		uint32_t hi_32;
+	} value_32;
+	struct {
+		uint32_t vector:8;
+		uint32_t delivery_mode:3;
+		uint32_t destination_mode:1;
+		uint32_t rsvd_1:2;
+		uint32_t level:1;
+		uint32_t trigger_mode:1;
+		uint32_t rsvd_2:2;
+		uint32_t shorthand:2;
+		uint32_t rsvd_3:12;
+		uint32_t dest_field:32;
+	} bits;
+};
 
 /**
- * @brief Save context of lapic
+ * @defgroup lapic_ext_apis LAPIC External Interfaces
+ *
+ * This is a group that includes LAPIC External Interfaces.
+ *
+ * @{
+ */
+
+/**
+ * @brief Save context of LAPIC
  *
  * @param[inout]	regs	Pointer to struct lapic_regs to hold the
- *				context of current lapic
+ *				context of current LAPIC
  */
 void save_lapic(struct lapic_regs *regs);
+
+/**
+ * @brief Enable LAPIC in x2APIC mode
+ *
+ * Enable LAPIC in x2APIC mode via MSR writes.
+ *
+ */
 void early_init_lapic(void);
+
+/**
+ * @brief Suspend LAPIC
+ *
+ * Suspend LAPIC by getting the APIC base addr and saving the registers.
+ */
+void suspend_lapic(void);
+
+/**
+ * @brief Resume LAPIC
+ *
+ * Resume LAPIC by setting the APIC base addr and restoring the registers.
+ */
+void resume_lapic(void);
+
+/**
+ * @brief Get the LAPIC ID
+ *
+ * Get the LAPIC ID via MSR read.
+ *
+ * @return LAPIC ID
+ */
+uint32_t get_cur_lapic_id(void);
+
+/**
+ * @}
+ */
+/* End of lapic_ext_apis */
+
 void init_lapic(uint16_t pcpu_id);
 void send_lapic_eoi(void);
 
 /**
- * @brief Get the lapic id
+ * @defgroup ipi_ext_apis IPI External Interfaces
  *
- * @return lapic id
+ * This is a group that includes IPI External Interfaces.
+ *
+ * @{
  */
-uint32_t get_cur_lapic_id(void);
 
 /**
  * @brief Send an SIPI to a specific cpu
  *
  * Send an Startup IPI to a specific cpu, to notify the cpu to start booting.
  *
- * @param[in]	cpu_startup_shorthand The startup_shorthand
  * @param[in]	dest_pcpu_id The id of destination physical cpu
  * @param[in]	cpu_startup_start_address The address for the dest pCPU to start running
  *
- * @pre cpu_startup_shorthand < INTR_CPU_STARTUP_UNKNOWN
  */
-void send_startup_ipi(enum intr_cpu_startup_shorthand cpu_startup_shorthand,
-		uint16_t dest_pcpu_id,
-		uint64_t cpu_startup_start_address);
+void send_startup_ipi(uint16_t dest_pcpu_id, uint64_t cpu_startup_start_address);
 
 /**
  * @brief Send an IPI to multiple pCPUs
@@ -101,7 +153,18 @@ void send_dest_ipi_mask(uint32_t dest_mask, uint32_t vector);
  */
 void send_single_ipi(uint16_t pcpu_id, uint32_t vector);
 
-void suspend_lapic(void);
-void resume_lapic(void);
+/**
+ * @}
+ */
+/* End of ipi_ext_apis */
+
+/**
+ * @brief Send an NMI signal to a single pCPU
+ *
+ * @param[in] pcpu_id The id of destination physical cpu
+ *
+ * @return None
+ */
+void send_single_nmi(uint16_t pcpu_id);
 
 #endif /* INTR_LAPIC_H */

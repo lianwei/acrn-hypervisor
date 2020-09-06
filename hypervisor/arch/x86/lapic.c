@@ -4,28 +4,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
-
-/* x2APIC Interrupt Command Register (ICR) structure */
-union apic_icr {
-	uint64_t value;
-	struct {
-		uint32_t lo_32;
-		uint32_t hi_32;
-	} value_32;
-	struct {
-		uint32_t vector:8;
-		uint32_t delivery_mode:3;
-		uint32_t destination_mode:1;
-		uint32_t rsvd_1:2;
-		uint32_t level:1;
-		uint32_t trigger_mode:1;
-		uint32_t rsvd_2:2;
-		uint32_t shorthand:2;
-		uint32_t rsvd_3:12;
-		uint32_t dest_field:32;
-	} bits;
-};
+#include <types.h>
+#include <bits.h>
+#include <msr.h>
+#include <cpu.h>
+#include <per_cpu.h>
+#include <cpu_caps.h>
+#include <lapic.h>
 
 union lapic_base_msr {
 	uint64_t value;
@@ -90,18 +75,13 @@ void early_init_lapic(void)
 void init_lapic(uint16_t pcpu_id)
 {
 	per_cpu(lapic_ldr, pcpu_id) = (uint32_t) msr_read(MSR_IA32_EXT_APIC_LDR);
-	/* Mask all LAPIC LVT entries before enabling the local APIC */
-	msr_write(MSR_IA32_EXT_APIC_LVT_CMCI, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_TIMER, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_THERMAL, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_PMI, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_LINT0, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_LINT1, LAPIC_LVT_MASK);
-	msr_write(MSR_IA32_EXT_APIC_LVT_ERROR, LAPIC_LVT_MASK);
+
+	/* Set the mask bits for all the LVT entries by disabling a local APIC software. */
+	msr_write(MSR_IA32_EXT_APIC_SIVR, 0UL);
 
 	/* Enable Local APIC */
 	/* TODO: add spurious-interrupt handler */
-	msr_write(MSR_IA32_EXT_APIC_SIVR, LAPIC_SVR_APIC_ENABLE_MASK | LAPIC_SVR_VECTOR);
+	msr_write(MSR_IA32_EXT_APIC_SIVR, APIC_SVR_ENABLE | APIC_SVR_VECTOR);
 
 	/* Ensure there are no ISR bits set. */
 	clear_lapic_isr();
@@ -161,7 +141,7 @@ void suspend_lapic(void)
 
 	/* disable APIC with software flag */
 	val = msr_read(MSR_IA32_EXT_APIC_SIVR);
-	val = (~(uint64_t)LAPIC_SVR_APIC_ENABLE_MASK) & val;
+	val = (~(uint64_t)APIC_SVR_ENABLE) & val;
 	msr_write(MSR_IA32_EXT_APIC_SIVR, val);
 }
 
@@ -187,55 +167,41 @@ uint32_t get_cur_lapic_id(void)
 	return lapic_id;
 }
 
-/**
- * @pre cpu_startup_shorthand < INTR_CPU_STARTUP_UNKNOWN
- */
 void
-send_startup_ipi(enum intr_cpu_startup_shorthand cpu_startup_shorthand,
-	uint16_t dest_pcpu_id, uint64_t cpu_startup_start_address)
+send_startup_ipi(uint16_t dest_pcpu_id, uint64_t cpu_startup_start_address)
 {
 	union apic_icr icr;
-	uint8_t shorthand;
-	struct cpuinfo_x86 *cpu_info = get_cpu_info();
+	struct cpuinfo_x86 *cpu_info = get_pcpu_info();
 
 	icr.value = 0U;
-	icr.bits.destination_mode = INTR_LAPIC_ICR_PHYSICAL;
-
-	if (cpu_startup_shorthand == INTR_CPU_STARTUP_USE_DEST) {
-		shorthand = INTR_LAPIC_ICR_USE_DEST_ARRAY;
-		icr.value_32.hi_32 = per_cpu(lapic_id, dest_pcpu_id);
-	} else {		/* Use destination shorthand */
-		shorthand = INTR_LAPIC_ICR_ALL_EX_SELF;
-		icr.value_32.hi_32 = 0U;
-	}
+	icr.value_32.hi_32 = per_cpu(lapic_id, dest_pcpu_id);
 
 	/* Assert INIT IPI */
-	icr.bits.shorthand = shorthand;
+	icr.bits.destination_mode = INTR_LAPIC_ICR_PHYSICAL;
+	icr.bits.shorthand = INTR_LAPIC_ICR_USE_DEST_ARRAY;
 	icr.bits.delivery_mode = INTR_LAPIC_ICR_INIT;
-	icr.bits.level = INTR_LAPIC_ICR_ASSERT;
-	icr.bits.trigger_mode = INTR_LAPIC_ICR_LEVEL;
 	msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
 
 	/* Give 10ms for INIT sequence to complete for old processors.
-	 * Modern processors (family == 6) don't need to wait here.
+	 * BWG states that a delay cannot be avoided between the INIT IPI
+	 * and first Startup IPI, so on Modern processors (family == 6)
+	 * setting a delay value of 10us.
 	 */
-	if (cpu_info->family != 6U) {
+	if (cpu_info->displayfamily != 6U) {
 		/* delay 10ms */
 		udelay(10000U);
+	} else {
+		udelay(10U); /* 10us is enough for Modern processors */
 	}
-
-	/* De-assert INIT IPI */
-	icr.bits.level = INTR_LAPIC_ICR_DEASSERT;
-	msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
 
 	/* Send Start IPI with page number of secondary reset code */
 	icr.value_32.lo_32 = 0U;
-	icr.bits.shorthand = shorthand;
+	icr.bits.shorthand = INTR_LAPIC_ICR_USE_DEST_ARRAY;
 	icr.bits.delivery_mode = INTR_LAPIC_ICR_STARTUP;
 	icr.bits.vector = (uint8_t)(cpu_startup_start_address >> 12U);
 	msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
 
-	if (cpu_info->family == 6U) {
+	if (cpu_info->displayfamily == 6U) {
 		udelay(10U); /* 10us is enough for Modern processors */
 	} else {
 		udelay(200U); /* 200us for old processors */
@@ -247,22 +213,13 @@ send_startup_ipi(enum intr_cpu_startup_shorthand cpu_startup_shorthand,
 
 void send_dest_ipi_mask(uint32_t dest_mask, uint32_t vector)
 {
-	union apic_icr icr;
 	uint16_t pcpu_id;
 	uint32_t mask = dest_mask;
 
-	icr.value_32.lo_32 = vector | (INTR_LAPIC_ICR_PHYSICAL << 11U);
-
 	pcpu_id = ffs64(mask);
-
-	while (pcpu_id != INVALID_BIT_INDEX) {
+	while (pcpu_id < MAX_PCPU_NUM) {
 		bitmap32_clear_nolock(pcpu_id, &mask);
-		if (is_pcpu_active(pcpu_id)) {
-			icr.value_32.hi_32 = per_cpu(lapic_id, pcpu_id);
-			msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
-		} else {
-			pr_err("pcpu_id %d not in active!", pcpu_id);
-		}
+		send_single_ipi(pcpu_id, vector);
 		pcpu_id = ffs64(mask);
 	}
 }
@@ -272,14 +229,33 @@ void send_single_ipi(uint16_t pcpu_id, uint32_t vector)
 	union apic_icr icr;
 
 	if (is_pcpu_active(pcpu_id)) {
-		/* Set the destination field to the target processor. */
-		icr.value_32.hi_32 = per_cpu(lapic_id, pcpu_id);
+		if (get_pcpu_id() == pcpu_id) {
+			msr_write(MSR_IA32_EXT_APIC_SELF_IPI, vector);
+		} else {
+			/* Set the destination field to the target processor. */
+			icr.value_32.hi_32 = per_cpu(lapic_id, pcpu_id);
 
-		/* Write the vector ID to ICR. */
-		icr.value_32.lo_32 = vector | (INTR_LAPIC_ICR_PHYSICAL << 11U);
+			/* Write the vector ID to ICR. */
+			icr.value_32.lo_32 = vector | (INTR_LAPIC_ICR_PHYSICAL << 11U);
 
-		msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
+			msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
+		}
 	} else {
 		pr_err("pcpu_id %d not in active!", pcpu_id);
 	}
+}
+
+/**
+ * @pre pcpu_id < MAX_PCPU_NUM
+ *
+ * @return None
+ */
+void send_single_nmi(uint16_t pcpu_id)
+{
+	union apic_icr icr;
+
+	icr.value_32.hi_32 = per_cpu(lapic_id, pcpu_id);
+	icr.value_32.lo_32 = (INTR_LAPIC_ICR_PHYSICAL << 11U) | (INTR_LAPIC_ICR_NMI << 8U);
+
+	msr_write(MSR_IA32_EXT_APIC_ICR, icr.value);
 }

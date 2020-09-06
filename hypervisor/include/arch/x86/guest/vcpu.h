@@ -13,45 +13,21 @@
 #ifndef VCPU_H
 #define VCPU_H
 
-/* Number of GPRs saved / restored for guest in VCPU structure */
-#define NUM_GPRS                            16U
-#define GUEST_STATE_AREA_SIZE               512
-
-#define	CPU_CONTEXT_OFFSET_RAX			0U
-#define	CPU_CONTEXT_OFFSET_RCX			8U
-#define	CPU_CONTEXT_OFFSET_RDX			16U
-#define	CPU_CONTEXT_OFFSET_RBX			24U
-#define	CPU_CONTEXT_OFFSET_RSP			32U
-#define	CPU_CONTEXT_OFFSET_RBP			40U
-#define	CPU_CONTEXT_OFFSET_RSI			48U
-#define	CPU_CONTEXT_OFFSET_RDI			56U
-#define	CPU_CONTEXT_OFFSET_R8			64U
-#define	CPU_CONTEXT_OFFSET_R9			72U
-#define	CPU_CONTEXT_OFFSET_R10			80U
-#define	CPU_CONTEXT_OFFSET_R11			88U
-#define	CPU_CONTEXT_OFFSET_R12			96U
-#define	CPU_CONTEXT_OFFSET_R13			104U
-#define	CPU_CONTEXT_OFFSET_R14			112U
-#define	CPU_CONTEXT_OFFSET_R15			120U
-#define	CPU_CONTEXT_OFFSET_CR0			128U
-#define	CPU_CONTEXT_OFFSET_CR2			136U
-#define	CPU_CONTEXT_OFFSET_CR4			144U
-#define	CPU_CONTEXT_OFFSET_RIP			152U
-#define	CPU_CONTEXT_OFFSET_RFLAGS		160U
-#define	CPU_CONTEXT_OFFSET_IA32_SPEC_CTRL	168U
-#define	CPU_CONTEXT_OFFSET_IA32_EFER		176U
-#define	CPU_CONTEXT_OFFSET_EXTCTX_START		184U
-#define	CPU_CONTEXT_OFFSET_CR3			184U
-#define	CPU_CONTEXT_OFFSET_IDTR			192U
-#define	CPU_CONTEXT_OFFSET_LDTR			216U
-
-/*sizes of various registers within the VCPU data structure */
-#define VMX_CPU_S_FXSAVE_GUEST_AREA_SIZE    GUEST_STATE_AREA_SIZE
 
 #ifndef ASSEMBLER
 
-#include <guest.h>
+#include <acrn_common.h>
+#include <guest_memory.h>
 #include <virtual_cr.h>
+#include <vlapic.h>
+#include <vmtrr.h>
+#include <schedule.h>
+#include <event.h>
+#include <io_req.h>
+#include <msr.h>
+#include <cpu.h>
+#include <instr_emul.h>
+#include <vmx.h>
 
 /**
  * @brief vcpu
@@ -60,13 +36,112 @@
  * @{
  */
 
+/*
+ * VCPU related APIs
+ */
+
+/**
+ * @defgroup virt_int_injection Event ID supported for virtual interrupt injection
+ *
+ * This is a group that includes Event ID supported for virtual interrupt injection.
+ *
+ * @{
+ */
+
+/**
+ * @brief Request for exception injection
+ */
+#define ACRN_REQUEST_EXCP			0U
+
+/**
+ * @brief Request for vLAPIC event
+ */
+#define ACRN_REQUEST_EVENT			1U
+
+/**
+ * @brief Request for external interrupt from vPIC
+ */
+#define ACRN_REQUEST_EXTINT			2U
+
+/**
+ * @brief Request for non-maskable interrupt
+ */
+#define ACRN_REQUEST_NMI			3U
+
+/**
+ * @brief Request for EOI exit bitmap update
+ */
+#define ACRN_REQUEST_EOI_EXIT_BITMAP_UPDATE	4U
+
+/**
+ * @brief Request for EPT flush
+ */
+#define ACRN_REQUEST_EPT_FLUSH			5U
+
+/**
+ * @brief Request for triple fault
+ */
+#define ACRN_REQUEST_TRP_FAULT			6U
+
+/**
+ * @brief Request for VPID TLB flush
+ */
+#define ACRN_REQUEST_VPID_FLUSH			7U
+
+/**
+ * @brief Request for initilizing VMCS
+ */
+#define ACRN_REQUEST_INIT_VMCS			8U
+
+/**
+ * @brief Request for sync waiting WBINVD
+ */
+#define ACRN_REQUEST_WAIT_WBINVD		9U
+
+/**
+ * @}
+ */
+/* End of virt_int_injection */
+
+#define save_segment(seg, SEG_NAME)				\
+{								\
+	(seg).selector = exec_vmread16(SEG_NAME##_SEL);		\
+	(seg).base = exec_vmread(SEG_NAME##_BASE);		\
+	(seg).limit = exec_vmread32(SEG_NAME##_LIMIT);		\
+	(seg).attr = exec_vmread32(SEG_NAME##_ATTR);		\
+}
+
+#define load_segment(seg, SEG_NAME)				\
+{								\
+	exec_vmwrite16(SEG_NAME##_SEL, (seg).selector);		\
+	exec_vmwrite(SEG_NAME##_BASE, (seg).base);		\
+	exec_vmwrite32(SEG_NAME##_LIMIT, (seg).limit);		\
+	exec_vmwrite32(SEG_NAME##_ATTR, (seg).attr);		\
+}
+
+/* Define segments constants for guest */
+#define REAL_MODE_BSP_INIT_CODE_SEL     (0xf000U)
+#define REAL_MODE_DATA_SEG_AR           (0x0093U)
+#define REAL_MODE_CODE_SEG_AR           (0x009fU)
+#define PROTECTED_MODE_DATA_SEG_AR      (0xc093U)
+#define PROTECTED_MODE_CODE_SEG_AR      (0xc09bU)
+#define REAL_MODE_SEG_LIMIT             (0xffffU)
+#define PROTECTED_MODE_SEG_LIMIT        (0xffffffffU)
+#define DR7_INIT_VALUE                  (0x400UL)
+#define LDTR_AR                         (0x0082U) /* LDT, type must be 2, refer to SDM Vol3 26.3.1.2 */
+#define TR_AR                           (0x008bU) /* TSS (busy), refer to SDM Vol3 26.3.1.2 */
+
+#define foreach_vcpu(idx, vm, vcpu)				\
+	for ((idx) = 0U, (vcpu) = &((vm)->hw.vcpu_array[(idx)]);	\
+		(idx) < (vm)->hw.created_vcpus;			\
+		(idx)++, (vcpu) = &((vm)->hw.vcpu_array[(idx)])) \
+		if (vcpu->state != VCPU_OFFLINE)
+
 enum vcpu_state {
+	VCPU_OFFLINE = 0U,
 	VCPU_INIT,
 	VCPU_RUNNING,
-	VCPU_PAUSED,
 	VCPU_ZOMBIE,
-	VCPU_OFFLINE,
-	VCPU_UNKNOWN_STATE,
 };
 
 enum vm_cpu_mode {
@@ -76,88 +151,12 @@ enum vm_cpu_mode {
 	CPU_MODE_64BIT,			/* IA-32E mode (CS.L = 1) */
 };
 
-struct segment_sel {
-	uint16_t selector;
-	uint64_t base;
-	uint32_t limit;
-	uint32_t attr;
-};
+#define	VCPU_EVENT_IOREQ		0
+#define	VCPU_EVENT_VIRTUAL_INTERRUPT	1
+#define	VCPU_EVENT_SYNC_WBINVD		2
+#define	VCPU_EVENT_NUM			3
 
-/**
- * @brief registers info saved for vcpu running context
- */
-struct run_context {
-/* Contains the guest register set.
- * NOTE: This must be the first element in the structure, so that the offsets
- * in vmx_asm.S match
- */
-	union guest_cpu_regs_t {
-		struct acrn_gp_regs regs;
-		uint64_t longs[NUM_GPRS];
-	} guest_cpu_regs;
-
-	/** The guests CR registers 0, 2, 3 and 4. */
-	uint64_t cr0;
-
-	/* CPU_CONTEXT_OFFSET_CR2 =
-	*  offsetof(struct run_context, cr2) = 136
-	*/
-	uint64_t cr2;
-	uint64_t cr4;
-
-	uint64_t rip;
-	uint64_t rflags;
-
-	/* CPU_CONTEXT_OFFSET_IA32_SPEC_CTRL =
-	*  offsetof(struct run_context, ia32_spec_ctrl) = 168
-	*/
-	uint64_t ia32_spec_ctrl;
-	uint64_t ia32_efer;
-};
-
-/*
- * extended context does not save/restore during vm exity/entry, it's mainly
- * used in trusty world switch
- */
-struct ext_context {
-	uint64_t cr3;
-
-	/* segment registers */
-	struct segment_sel idtr;
-	struct segment_sel ldtr;
-	struct segment_sel gdtr;
-	struct segment_sel tr;
-	struct segment_sel cs;
-	struct segment_sel ss;
-	struct segment_sel ds;
-	struct segment_sel es;
-	struct segment_sel fs;
-	struct segment_sel gs;
-
-	uint64_t ia32_star;
-	uint64_t ia32_lstar;
-	uint64_t ia32_fmask;
-	uint64_t ia32_kernel_gs_base;
-
-	uint64_t ia32_pat;
-	uint32_t ia32_sysenter_cs;
-	uint64_t ia32_sysenter_esp;
-	uint64_t ia32_sysenter_eip;
-	uint64_t ia32_debugctl;
-
-	uint64_t dr7;
-	uint64_t tsc_offset;
-
-	uint64_t vmx_cr0;
-	uint64_t vmx_cr4;
-	uint64_t vmx_cr0_read_shadow;
-	uint64_t vmx_cr4_read_shadow;
-
-	/* The 512 bytes area to save the FPU/MMX/SSE states for the guest */
-	uint64_t
-	fxstore_guest_area[VMX_CPU_S_FXSAVE_GUEST_AREA_SIZE / sizeof(uint64_t)]
-	__aligned(16);
-};
+enum reset_mode;
 
 /* 2 worlds: 0 for Normal World, 1 for Secure World */
 #define NR_WORLD	2
@@ -165,17 +164,12 @@ struct ext_context {
 #define SECURE_WORLD	1
 
 #define NUM_WORLD_MSRS		2U
-#define NUM_COMMON_MSRS		7U
+#define NUM_COMMON_MSRS		17U
 #define NUM_GUEST_MSRS		(NUM_WORLD_MSRS + NUM_COMMON_MSRS)
 
 #define EOI_EXIT_BITMAP_SIZE	256U
 
-struct event_injection_info {
-	uint32_t intr_info;
-	uint32_t error_code;
-};
-
-struct cpu_context {
+struct guest_cpu_context {
 	struct run_context run_ctx;
 	struct ext_context ext_ctx;
 
@@ -185,33 +179,40 @@ struct cpu_context {
 
 /* Intel SDM 24.8.2, the address must be 16-byte aligned */
 struct msr_store_entry {
-	uint32_t msr_num;
+	uint32_t msr_index;
 	uint32_t reserved;
 	uint64_t value;
 } __aligned(16);
 
 enum {
 	MSR_AREA_TSC_AUX = 0,
+	MSR_AREA_IA32_PQR_ASSOC,
 	MSR_AREA_COUNT,
 };
 
 struct msr_store_area {
 	struct msr_store_entry guest[MSR_AREA_COUNT];
 	struct msr_store_entry host[MSR_AREA_COUNT];
+	uint32_t count;	/* actual count of entries to be loaded/restored during VMEntry/VMExit */
 };
 
 struct acrn_vcpu_arch {
 	/* vmcs region for this vcpu, MUST be 4KB-aligned */
 	uint8_t vmcs[PAGE_SIZE];
+
+	/* MSR bitmap region for this vcpu, MUST be 4-Kbyte aligned */
+	uint8_t msr_bitmap[PAGE_SIZE];
+
 	/* per vcpu lapic */
 	struct acrn_vlapic vlapic;
 
-#ifdef CONFIG_MTRR_ENABLED
+	/* pid MUST be 64 bytes aligned */
+	struct pi_desc pid __aligned(64);
+
 	struct acrn_vmtrr vmtrr;
-#endif
 
 	int32_t cur_context;
-	struct cpu_context contexts[NR_WORLD];
+	struct guest_cpu_context contexts[NR_WORLD];
 
 	/* common MSRs, world_msrs[] is a subset of it */
 	uint64_t guest_msrs[NUM_GUEST_MSRS];
@@ -228,7 +229,7 @@ struct acrn_vcpu_arch {
 	} exception_info;
 
 	uint8_t lapic_mask;
-	uint32_t irq_window_enabled;
+	bool irq_window_enabled;
 	uint32_t nrexits;
 
 	/* VCPU context state information */
@@ -243,15 +244,12 @@ struct acrn_vcpu_arch {
 
 	/* interrupt injection information */
 	uint64_t pending_req;
-	bool inject_event_pending;
-	struct event_injection_info inject_info;
 
 	/* List of MSRS to be stored and loaded on VM exits or VM entries */
 	struct msr_store_area msr_area;
 
 	/* EOI_EXIT_BITMAP buffer, for the bitmap update */
 	uint64_t eoi_exit_bitmap[EOI_EXIT_BITMAP_SIZE >> 6U];
-	spinlock_t lock;
 } __aligned(PAGE_SIZE);
 
 struct acrn_vm;
@@ -260,22 +258,21 @@ struct acrn_vcpu {
 
 	/* Architecture specific definitions for this VCPU */
 	struct acrn_vcpu_arch arch;
-	uint16_t pcpu_id;	/* Physical CPU ID of this VCPU */
 	uint16_t vcpu_id;	/* virtual identifier for VCPU */
 	struct acrn_vm *vm;		/* Reference to the VM this VCPU belongs to */
 
-	/* State of this VCPU before suspend */
-	volatile enum vcpu_state prev_state;
 	volatile enum vcpu_state state;	/* State of this VCPU */
 
-	struct sched_object sched_obj;
+	struct thread_object thread_obj;
 	bool launched; /* Whether the vcpu is launched on target pcpu */
-	uint32_t running; /* vcpu is picked up and run? */
 
+	struct instr_emul_ctxt inst_ctxt;
 	struct io_request req; /* used by io/ept emulation */
 
 	uint64_t reg_cached;
 	uint64_t reg_updated;
+
+	struct sched_event events[VCPU_EVENT_NUM];
 } __aligned(PAGE_SIZE);
 
 struct vcpu_dump {
@@ -284,9 +281,20 @@ struct vcpu_dump {
 	uint32_t str_max;
 };
 
+struct guest_mem_dump {
+	struct acrn_vcpu *vcpu;
+	uint64_t gva;
+	uint64_t len;
+};
+
 static inline bool is_vcpu_bsp(const struct acrn_vcpu *vcpu)
 {
-	return (vcpu->vcpu_id == BOOT_CPU_ID);
+	return (vcpu->vcpu_id == BSP_CPU_ID);
+}
+
+static inline enum vm_cpu_mode get_vcpu_mode(const struct acrn_vcpu *vcpu)
+{
+	return vcpu->arch.cpu_mode;
 }
 
 /* do not update Guest RIP for next VM Enter */
@@ -295,14 +303,30 @@ static inline void vcpu_retain_rip(struct acrn_vcpu *vcpu)
 	(vcpu)->arch.inst_len = 0U;
 }
 
-static inline struct acrn_vlapic *
-vcpu_vlapic(struct acrn_vcpu *vcpu)
+static inline struct acrn_vlapic *vcpu_vlapic(struct acrn_vcpu *vcpu)
 {
 	return &(vcpu->arch.vlapic);
 }
 
-void default_idle(__unused struct sched_object *obj);
-void vcpu_thread(struct sched_object *obj);
+/**
+ * @brief Get pointer to PI description.
+ *
+ * @param[in] vcpu Target vCPU
+ *
+ * @return pointer to PI description
+ *
+ * @pre vcpu != NULL
+ */
+static inline struct pi_desc *get_pi_desc(struct acrn_vcpu *vcpu)
+{
+	return &(vcpu->arch.pid);
+}
+
+uint16_t pcpuid_from_vcpu(const struct acrn_vcpu *vcpu);
+void default_idle(__unused struct thread_object *obj);
+void vcpu_thread(struct thread_object *obj);
+
+int32_t vmx_vmrun(struct run_context *context, int32_t ops, int32_t ibrs);
 
 /* External Interfaces */
 
@@ -326,6 +350,8 @@ uint64_t vcpu_get_gpreg(const struct acrn_vcpu *vcpu, uint32_t reg);
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] reg register of the vcpu
  * @param[in] val the value set the register of the vcpu
+ *
+ * @return None
  */
 void vcpu_set_gpreg(struct acrn_vcpu *vcpu, uint32_t reg, uint64_t val);
 
@@ -347,6 +373,8 @@ uint64_t vcpu_get_rip(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] val the value set RIP
+ *
+ * @return None
  */
 void vcpu_set_rip(struct acrn_vcpu *vcpu, uint64_t val);
 
@@ -359,7 +387,7 @@ void vcpu_set_rip(struct acrn_vcpu *vcpu, uint64_t val);
  *
  * @return the value of RSP.
  */
-uint64_t vcpu_get_rsp(struct acrn_vcpu *vcpu);
+uint64_t vcpu_get_rsp(const struct acrn_vcpu *vcpu);
 
 /**
  * @brief set vcpu RSP value
@@ -368,6 +396,8 @@ uint64_t vcpu_get_rsp(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] val the value set RSP
+ *
+ * @return None
  */
 void vcpu_set_rsp(struct acrn_vcpu *vcpu, uint64_t val);
 
@@ -389,6 +419,8 @@ uint64_t vcpu_get_efer(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] val the value set EFER
+ *
+ * @return None
  */
 void vcpu_set_efer(struct acrn_vcpu *vcpu, uint64_t val);
 
@@ -410,6 +442,8 @@ uint64_t vcpu_get_rflags(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] val the value set RFLAGS
+ *
+ * @return None
  */
 void vcpu_set_rflags(struct acrn_vcpu *vcpu, uint64_t val);
 
@@ -434,6 +468,7 @@ uint64_t vcpu_get_guest_msr(const struct acrn_vcpu *vcpu, uint32_t msr);
  * @param[in] msr the guest MSR
  * @param[in] val the value to set the target MSR
  *
+ * @return None
  */
 void vcpu_set_guest_msr(struct acrn_vcpu *vcpu, uint32_t msr, uint64_t val);
 
@@ -442,19 +477,19 @@ void vcpu_set_guest_msr(struct acrn_vcpu *vcpu, uint32_t msr, uint64_t val);
  *
  * @param[in] vcpu pointer to vcpu data structure
  *
- * @return void
+ * @return None
  */
-void vcpu_set_vmcs_eoi_exit(struct acrn_vcpu *vcpu);
+void vcpu_set_vmcs_eoi_exit(const struct acrn_vcpu *vcpu);
 
 /**
- * @brief reset eoi_exit_bitmap
+ * @brief reset all eoi_exit_bitmaps
  *
  * @param[in] vcpu pointer to vcpu data structure
  *
- * @return void
+ * @return None
  */
 
-void vcpu_reset_eoi_exit_all(struct acrn_vcpu *vcpu);
+void vcpu_reset_eoi_exit_bitmaps(struct acrn_vcpu *vcpu);
 
 /**
  * @brief set eoi_exit_bitmap bit
@@ -464,9 +499,20 @@ void vcpu_reset_eoi_exit_all(struct acrn_vcpu *vcpu);
  * @param[in] vcpu pointer to vcpu data structure
  * @param[in] vector
  *
- * @return void 
+ * @return None
  */
-void vcpu_set_eoi_exit(struct acrn_vcpu *vcpu, uint32_t vector);
+void vcpu_set_eoi_exit_bitmap(struct acrn_vcpu *vcpu, uint32_t vector);
+/**
+ * @brief clear eoi_exit_bitmap bit
+ *
+ * Clear corresponding bit of vector in eoi_exit_bitmap
+ *
+ * @param[in] vcpu pointer to vcpu data structure
+ * @param[in] vector
+ *
+ * @return None
+ */
+void vcpu_clear_eoi_exit_bitmap(struct acrn_vcpu *vcpu, uint32_t vector);
 /**
  * @brief set all the vcpu registers
  *
@@ -474,6 +520,8 @@ void vcpu_set_eoi_exit(struct acrn_vcpu *vcpu, uint32_t vector);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] vcpu_regs all the registers' value
+ *
+ * @return None
  */
 void set_vcpu_regs(struct acrn_vcpu *vcpu, struct acrn_vcpu_regs *vcpu_regs);
 
@@ -483,18 +531,34 @@ void set_vcpu_regs(struct acrn_vcpu *vcpu, struct acrn_vcpu_regs *vcpu_regs);
  * Reset target vCPU's all registers in run_context to initial values.
  *
  * @param[inout] vcpu pointer to vcpu data structure
+ *
+ * @return None
  */
 void reset_vcpu_regs(struct acrn_vcpu *vcpu);
 
 /**
- * @brief set the vcpu AP entry
+ * @brief Initialize the protect mode vcpu registers
  *
- * Set target vCPU's AP running entry in run_context.
+ * Initialize vCPU's all registers in run_context to initial protece mode values.
  *
  * @param[inout] vcpu pointer to vcpu data structure
- * @param[in] entry the entry value for AP
+ * @param[in] vgdt_base_gpa guest physical address of gdt for guest
+ *
+ * @return None
  */
-void set_ap_entry(struct acrn_vcpu *vcpu, uint64_t entry);
+void init_vcpu_protect_mode_regs(struct acrn_vcpu *vcpu, uint64_t vgdt_base_gpa);
+
+/**
+ * @brief set the vCPU startup entry
+ *
+ * Set target vCPU's startup entry in run_context.
+ *
+ * @param[inout] vcpu pointer to vCPU data structure
+ * @param[in] entry startup entry for the vCPU
+ *
+ * @return None
+ */
+void set_vcpu_startup_entry(struct acrn_vcpu *vcpu, uint64_t entry);
 
 static inline bool is_long_mode(struct acrn_vcpu *vcpu)
 {
@@ -511,7 +575,11 @@ static inline bool is_pae(struct acrn_vcpu *vcpu)
 	return (vcpu_get_cr4(vcpu) & CR4_PAE) != 0UL;
 }
 
-struct acrn_vcpu* get_ever_run_vcpu(uint16_t pcpu_id);
+struct acrn_vcpu *get_running_vcpu(uint16_t pcpu_id);
+struct acrn_vcpu *get_ever_run_vcpu(uint16_t pcpu_id);
+
+void save_xsave_area(struct acrn_vcpu *vcpu, struct ext_context *ectx);
+void rstore_xsave_area(const struct acrn_vcpu *vcpu, const struct ext_context *ectx);
 
 /**
  * @brief create a vcpu for the target vm
@@ -540,8 +608,6 @@ int32_t create_vcpu(uint16_t pcpu_id, struct acrn_vm *vm, struct acrn_vcpu **rtn
  */
 int32_t run_vcpu(struct acrn_vcpu *vcpu);
 
-int32_t shutdown_vcpu(struct acrn_vcpu *vcpu);
-
 /**
  * @brief unmap the vcpu with pcpu and free its vlapic
  *
@@ -549,6 +615,8 @@ int32_t shutdown_vcpu(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @pre vcpu != NULL
+ * @pre vcpu->state == VCPU_ZOMBIE
+ * @return None
  */
 void offline_vcpu(struct acrn_vcpu *vcpu);
 
@@ -558,27 +626,24 @@ void offline_vcpu(struct acrn_vcpu *vcpu);
  * Reset all fields in a vCPU instance, the vCPU state is reset to VCPU_INIT.
  *
  * @param[inout] vcpu pointer to vcpu data structure
+ * @param[in] mode the reset mode
+ * @pre vcpu != NULL
+ * @pre vcpu->state == VCPU_ZOMBIE
+ * @return None
  */
-void reset_vcpu(struct acrn_vcpu *vcpu);
+void reset_vcpu(struct acrn_vcpu *vcpu, enum reset_mode mode);
 
 /**
  * @brief pause the vcpu and set new state
  *
- * Change a vCPU state to VCPU_PAUSED or VCPU_ZOMBIE, and make a reschedule request for it.
+ * Change a vCPU state to VCPU_ZOMBIE, and make a reschedule request for it.
  *
  * @param[inout] vcpu pointer to vcpu data structure
  * @param[in] new_state the state to set vcpu
- */
-void pause_vcpu(struct acrn_vcpu *vcpu, enum vcpu_state new_state);
-
-/**
- * @brief resume the vcpu
  *
- * Change a vCPU state to VCPU_RUNNING, and make a reschedule request for it.
- *
- * @param[inout] vcpu pointer to vcpu data structure
+ * @return None
  */
-void resume_vcpu(struct acrn_vcpu *vcpu);
+void zombie_vcpu(struct acrn_vcpu *vcpu, enum vcpu_state new_state);
 
 /**
  * @brief set the vcpu to running state, then it will be scheculed.
@@ -586,8 +651,22 @@ void resume_vcpu(struct acrn_vcpu *vcpu);
  * Adds a vCPU into the run queue and make a reschedule request for it. It sets the vCPU state to VCPU_RUNNING.
  *
  * @param[inout] vcpu pointer to vcpu data structure
+ * @pre vcpu != NULL
+ * @pre vcpu->state == VCPU_INIT
+ * @return None
  */
-void schedule_vcpu(struct acrn_vcpu *vcpu);
+void launch_vcpu(struct acrn_vcpu *vcpu);
+
+/**
+ * @brief kick the vcpu and let it handle pending events
+ *
+ * Kick a vCPU to handle the pending events.
+ *
+ * @param[in] vcpu pointer to vcpu data structure
+ *
+ * @return None
+ */
+void kick_vcpu(struct acrn_vcpu *vcpu);
 
 /**
  * @brief create a vcpu for the vm and mapped to the pcpu.
@@ -596,8 +675,47 @@ void schedule_vcpu(struct acrn_vcpu *vcpu);
  *
  * @param[inout] vm pointer to vm data structure
  * @param[in] pcpu_id which the vcpu will be mapped
+ *
+ * @retval 0 on success
+ * @retval -EINVAL if the vCPU ID is invalid
  */
 int32_t prepare_vcpu(struct acrn_vm *vm, uint16_t pcpu_id);
+
+/**
+ * @brief get physical destination cpu mask
+ *
+ * get the corresponding physical destination cpu mask for the vm and virtual destination cpu mask
+ *
+ * @param[in] vm pointer to vm data structure
+ * @param[in] vdmask virtual destination cpu mask
+ *
+ * @return The physical destination CPU mask
+ */
+uint64_t vcpumask2pcpumask(struct acrn_vm *vm, uint64_t vdmask);
+bool is_lapic_pt_enabled(struct acrn_vcpu *vcpu);
+
+/**
+ * @brief handle posted interrupts
+ *
+ * VT-d PI handler, find the corresponding vCPU for this IRQ,
+ * if the associated PID's bit ON is set, wake it up.
+ *
+ * @param[in] vcpu_index a zero based index of where the vCPU is located in the vCPU list for current pCPU
+ * @pre vcpu_index < CONFIG_MAX_VM_NUM
+ *
+ * @return None
+ */
+void vcpu_handle_pi_notification(uint32_t vcpu_index);
+
+/*
+ * @brief Update the state of vCPU and state of vlapic
+ *
+ * The vlapic state of VM shall be updated for some vCPU
+ * state update cases, such as from VCPU_INIT to VCPU_RUNNING.
+
+ * @pre (vcpu != NULL)
+ */
+void vcpu_set_state(struct acrn_vcpu *vcpu, enum vcpu_state new_state);
 
 /**
  * @}

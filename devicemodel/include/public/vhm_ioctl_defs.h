@@ -64,6 +64,7 @@
 /* General */
 #define IC_ID_GEN_BASE                  0x0UL
 #define IC_GET_API_VERSION             _IC_ID(IC_ID, IC_ID_GEN_BASE + 0x00)
+#define IC_GET_PLATFORM_INFO           _IC_ID(IC_ID, IC_ID_GEN_BASE + 0x03)
 
 /* VM management */
 #define IC_ID_VM_BASE                  0x10UL
@@ -104,6 +105,12 @@
 #define IC_VM_PCI_MSIX_REMAP           _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x02)
 #define IC_SET_PTDEV_INTR_INFO         _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x03)
 #define IC_RESET_PTDEV_INTR_INFO       _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x04)
+#define IC_ASSIGN_PCIDEV               _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x05)
+#define IC_DEASSIGN_PCIDEV             _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x06)
+#define IC_ASSIGN_MMIODEV              _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x07)
+#define IC_DEASSIGN_MMIODEV            _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x08)
+#define IC_CREATE_HV_VDEV              _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x09)
+#define IC_DESTROY_HV_VDEV             _IC_ID(IC_ID, IC_ID_PCI_BASE + 0x0A)
 
 /* Power management */
 #define IC_ID_PM_BASE                   0x60UL
@@ -147,6 +154,100 @@ struct vm_memmap {
 };
 
 /**
+ * @brief Info to assign or deassign PCI for a VM
+ *
+ */
+struct acrn_assign_pcidev {
+#define QUIRK_PTDEV	(1 << 0)	/* We will only handle general part in HV, others in DM */
+	/** the type of the the pass-through PCI device */
+	uint32_t type;
+
+	/** virtual BDF# of the pass-through PCI device */
+	uint16_t virt_bdf;
+
+	/** physical BDF# of the pass-through PCI device */
+	uint16_t phys_bdf;
+
+	/** the PCI Interrupt Line, initialized by ACRN-DM, which is RO and
+	 *  ideally not used for pass-through MSI/MSI-x devices.
+	 */
+	uint8_t intr_line;
+
+	/** the PCI Interrupt Pin, initialized by ACRN-DM, which is RO and
+	 *  ideally not used for pass-through MSI/MSI-x devices.
+	 */
+	uint8_t intr_pin;
+
+	/** the base address of the PCI BAR, initialized by ACRN-DM. */
+	uint32_t bar[6];
+
+	/** reserved for extension */
+	uint32_t rsvd2[6];
+
+} __attribute__((aligned(8)));
+
+/**
+ * @brief Info to assign or deassign a MMIO device for a VM
+ */
+struct acrn_mmiodev {
+	/** the gpa of the MMIO region for the MMIO device */
+	uint64_t base_gpa;
+
+	/** the hpa of the MMIO region for the MMIO device */
+	uint64_t base_hpa;
+
+	/** the size of the MMIO region for the MMIO device */
+	uint64_t size;
+
+	/** reserved for extension */
+	uint64_t reserved[13];
+
+} __attribute__((aligned(8)));
+
+/**
+ * @brief Info to create or destroy a virtual PCI or legacy device for a VM
+ *
+ * the parameter for HC_CREATE_VDEV or HC_DESTROY_VDEV hypercall
+ */
+struct acrn_emul_dev {
+	/*
+	 * the identifier of the device, the low 32 bits represent the vendor
+	 * id and device id of PCI device and the high 32 bits represent the
+	 * device number of the legacy device
+	 */
+	union dev_id_info {
+		uint64_t value;
+		struct fields_info {
+			uint16_t vendor_id;
+			uint16_t device_id;
+			uint32_t legacy_device_number;
+		} fields;
+	} dev_id;
+
+	/*
+	 * the slot of the device, if the device is a PCI device, the slot
+	 * represents BDF, otherwise it represents legacy device slot number
+	 */
+	uint32_t slot;
+
+	/** reserved for extension */
+	uint32_t reserved0;
+
+	/** the IO resource address of the device, initialized by ACRN-DM. */
+	uint32_t io_addr[6];
+
+	/** the IO resource size of the device, initialized by ACRN-DM. */
+	uint32_t io_size[6];
+
+	/** the options for the virtual device, initialized by ACRN-DM. */
+	uint8_t args[128];
+
+	/** reserved for extension */
+	uint64_t reserved1[8];
+
+} __attribute__((aligned(8)));
+
+/**
  * @brief pass thru device irq data structure
  */
 struct ic_ptdev_irq {
@@ -159,30 +260,16 @@ struct ic_ptdev_irq {
 	uint16_t virt_bdf;	/* IN: Device virtual BDF# */
 	/** physical bdf description of pass thru device */
 	uint16_t phys_bdf;	/* IN: Device physical BDF# */
-	union {
-		/** info of IOAPIC/PIC interrupt */
-		struct {
-			/** virtual IOAPIC pin */
-			uint32_t virt_pin;
-			/** physical IOAPIC pin */
-			uint32_t phys_pin;
-			/** PIC pin */
-			uint32_t is_pic_pin;
-		} intx;
 
-		/** info of MSI/MSIX interrupt */
-		struct {
-                        /* Keep this filed on top of msix */
-			/** vector count of MSI/MSIX */
-			uint32_t vector_cnt;
-
-			/** size of MSIX table(round up to 4K) */
-			uint32_t table_size;
-
-			/** physical address of MSIX table */
-			uint64_t table_paddr;
-		} msix;
-	};
+	/** info of IOAPIC/PIC interrupt */
+	struct {
+		/** virtual IOAPIC pin */
+		uint32_t virt_pin;
+		/** physical IOAPIC pin */
+		uint32_t phys_pin;
+		/** PIC pin */
+		uint32_t is_pic_pin;
+	} intx;
 };
 
 /**
@@ -204,6 +291,25 @@ struct api_version {
 	/** minor version of VHM API */
 	uint32_t minor_version;
 };
+
+/**
+ * @brief data structure to track VHM platform information
+ */
+struct platform_info {
+	/** Hardware Information */
+	/** Physical CPU number */
+	uint16_t cpu_num;
+
+	/** Align the size of version & hardware info to 128Bytes. */
+	uint8_t reserved0[126];
+
+	/** Configuration Information */
+	/** Maximum vCPU number for one VM. */
+	uint16_t max_vcpus_per_vm;
+
+	/** Align the size of Configuration info to 128Bytes. */
+	uint8_t reserved1[126];
+} __aligned(8);
 
 struct acrn_ioeventfd {
 #define ACRN_IOEVENTFD_FLAG_PIO		0x01

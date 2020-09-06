@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
+#include <vm.h>
+#include <io.h>
 
 #define CMOS_ADDR_PORT		0x70U
 #define CMOS_DATA_PORT		0x71U
@@ -28,13 +29,14 @@ static bool cmos_update_in_progress(void)
 static uint8_t cmos_get_reg_val(uint8_t addr)
 {
 	uint8_t reg;
-	int32_t tries = 2000U;
+	int32_t tries = 2000;
 
 	spinlock_obtain(&cmos_lock);
 
 	/* Make sure an update isn't in progress */
-	while (cmos_update_in_progress() && tries--)
-	;
+	while (cmos_update_in_progress() && (tries != 0)) {
+		tries -= 1;
+	}
 
 	reg = cmos_read(addr);
 
@@ -42,37 +44,45 @@ static uint8_t cmos_get_reg_val(uint8_t addr)
 	return reg;
 }
 
-static uint32_t vrtc_read(struct acrn_vm *vm, uint16_t addr, __unused size_t width)
+/**
+ * @pre vcpu != NULL
+ * @pre vcpu->vm != NULL
+ */
+static bool vrtc_read(struct acrn_vcpu *vcpu, uint16_t addr, __unused size_t width)
 {
-	uint8_t reg;
 	uint8_t offset;
+	struct pio_request *pio_req = &vcpu->req.reqs.pio;
+	struct acrn_vm *vm = vcpu->vm;
 
 	offset = vm->vrtc_offset;
 
 	if (addr == CMOS_ADDR_PORT) {
-		return vm->vrtc_offset;
+		pio_req->value = vm->vrtc_offset;
+	} else {
+		pio_req->value = cmos_get_reg_val(offset);
 	}
 
-	reg = cmos_get_reg_val(offset);
-	return reg;
+	return true;
 }
 
-static void vrtc_write(struct acrn_vm *vm, uint16_t addr, size_t width,
+/**
+ * @pre vcpu != NULL
+ * @pre vcpu->vm != NULL
+ */
+static bool vrtc_write(struct acrn_vcpu *vcpu, uint16_t addr, size_t width,
 			uint32_t value)
 {
-
-	if (width != 1U)
-		return;
-
-	if (addr == CMOS_ADDR_PORT) {
-		vm->vrtc_offset = value & 0x7FU;
+	if ((width == 1U) && (addr == CMOS_ADDR_PORT)) {
+		vcpu->vm->vrtc_offset = (uint8_t)value & 0x7FU;
 	}
+
+	return true;
 }
 
 void vrtc_init(struct acrn_vm *vm)
 {
 	struct vm_io_range range = {
-	.flags = IO_ATTR_RW, .base = CMOS_ADDR_PORT, .len = 2U};
+	.base = CMOS_ADDR_PORT, .len = 2U};
 
 	/* Initializing the CMOS RAM offset to 0U */
 	vm->vrtc_offset = 0U;

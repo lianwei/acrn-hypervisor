@@ -6,9 +6,11 @@
  * this file contains pure vmx operations
  */
 
-#include <hypervisor.h>
-#include <vm0_boot.h>
-#include <cpu.h>
+#include <types.h>
+#include <msr.h>
+#include <per_cpu.h>
+#include <pgtable.h>
+#include <vmx.h>
 
 /**
  * @pre addr != NULL && addr is 4KB-aligned

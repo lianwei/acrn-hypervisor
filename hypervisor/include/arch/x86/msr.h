@@ -18,6 +18,7 @@
 #define MSR_IA32_TIME_STAMP_COUNTER		0x00000010U
 #define MSR_IA32_PLATFORM_ID			0x00000017U
 #define MSR_IA32_APIC_BASE			0x0000001BU
+#define MSR_TEST_CTL				0x00000033U
 #define MSR_IA32_FEATURE_CONTROL		0x0000003AU
 #define MSR_IA32_TSC_ADJUST			0x0000003BU
 /* Speculation Control */
@@ -40,6 +41,7 @@
 #define MSR_IA32_PMC5				0x000000C6U
 #define MSR_IA32_PMC6				0x000000C7U
 #define MSR_IA32_PMC7				0x000000C8U
+#define MSR_IA32_CORE_CAPABILITIES		0x000000CFU
 /* Max. qualified performance clock counter */
 #define MSR_IA32_MPERF				0x000000E7U
 /* Actual performance clock counter */
@@ -276,6 +278,13 @@
 #define MSR_IA32_RTIT_ADDR3_A			0x00000586U
 #define MSR_IA32_RTIT_ADDR3_B			0x00000587U
 #define MSR_IA32_DS_AREA			0x00000600U
+#define MSR_IA32_U_CET				0x000006A0U
+#define MSR_IA32_S_CET				0x000006A2U
+#define MSR_IA32_PL0_SSP			0x000006A4U
+#define MSR_IA32_PL1_SSP			0x000006A5U
+#define MSR_IA32_PL2_SSP			0x000006A6U
+#define MSR_IA32_PL3_SSP			0x000006A7U
+#define MSR_IA32_INTERRUPT_SSP_TABLE_ADDR	0x000006A8U
 #define MSR_IA32_TSC_DEADLINE			0x000006E0U
 #define MSR_IA32_PM_ENABLE			0x00000770U
 #define MSR_IA32_HWP_CAPABILITIES		0x00000771U
@@ -335,12 +344,13 @@
 #define MSR_IA32_QM_EVTSEL			0x00000C8DU
 #define MSR_IA32_QM_CTR				0x00000C8EU
 #define MSR_IA32_PQR_ASSOC			0x00000C8FU
-#define MSR_IA32_L3_MASK_0			0x00000C90U
+#define MSR_IA32_L3_MASK_BASE			0x00000C90U
 #define MSR_IA32_XSS				0x00000DA0U
 #define MSR_IA32_PKG_HDC_CTL			0x00000DB0U
 #define MSR_IA32_PM_CTL1			0x00000DB1U
 #define MSR_IA32_THREAD_STALL			0x00000DB2U
-#define MSR_IA32_L2_MASK_0			0x00000D10U
+#define MSR_IA32_L2_MASK_BASE			0x00000D10U
+#define MSR_IA32_MBA_MASK_BASE			0x00000D50U
 #define MSR_IA32_BNDCFGS			0x00000D90U
 #define MSR_IA32_EFER				0xC0000080U
 #define MSR_IA32_STAR				0xC0000081U
@@ -405,8 +415,13 @@
 #define MSR_LASTBRANCH_1			0x000001DCU
 #define MSR_LASTBRANCH_2			0x000001DDU
 #define MSR_LASTBRANCH_3			0x000001DEU
+#define MSR_PRMRR_PHYS_BASE			0x000001F4U
+#define MSR_PRMRR_PHYS_MASK			0x000001F5U
 #define MSR_PRMRR_VALID_CONFIG			0x000001FBU
 #define MSR_POWER_CTL				0x000001FCU
+#define MSR_UNCORE_PRMRR_PHYS_BASE		0x000002F4U
+#define MSR_UNCORE_PRMRR_PHYS_MASK		0x000002F5U
+
 #define MSR_BR_DETECT_CTRL			0x00000350U
 #define MSR_BR_DETECT_STATUS			0x00000351U
 #define MSR_UNCORE_PERF_GLOBAL_OVF_CTRL		0x00000393U
@@ -548,54 +563,55 @@
 #define PAT_MEM_TYPE_UCM			0x07UL	/* uncached minus */
 
 /* MISC_ENABLE bits: architectural */
-#define MSR_IA32_MISC_ENABLE_FAST_STRING	(1U << 0U)
+#define MSR_IA32_MISC_ENABLE_FAST_STRING	(1UL << 0U)
+#define MSR_IA32_MISC_ENABLE_TCC		(1UL << 3U)
+#define MSR_IA32_MISC_ENABLE_PMA		(1UL << 7U)
+#define MSR_IA32_MISC_ENABLE_BTS_UNAVAIL	(1UL << 11U)
+#define MSR_IA32_MISC_ENABLE_PEBS_UNAVAIL	(1UL << 12U)
+#define MSR_IA32_MISC_ENABLE_TM2_ENABLE		(1UL << 13U)
+#define MSR_IA32_MISC_ENABLE_EITS		(1UL << 16U)
+#define MSR_IA32_MISC_ENABLE_MONITOR_ENA	(1UL << 18U)
+#define MSR_IA32_MISC_ENABLE_LIMIT_CPUID	(1UL << 22U)
+#define MSR_IA32_MISC_ENABLE_xTPR		(1UL << 23U)
+#define MSR_IA32_MISC_ENABLE_XD_DISABLE		(1UL << 34U)
+
+/* MSR_IA32_XSS bits */
+#define MSR_IA32_XSS_PT				(1UL << 8U)
+#define MSR_IA32_XSS_CET_U			(1UL << 11U)
+#define MSR_IA32_XSS_CET_S			(1UL << 12U)
+#define MSR_IA32_XSS_HDC			(1UL << 13U)
+
+/* Miscellaneous data */
+#define MSR_IA32_MISC_UNRESTRICTED_GUEST	(1U<<5U)
+
+/* Width of physical address used by VMX related region */
+#define MSR_IA32_VMX_BASIC_ADDR_WIDTH		(1UL << 48U)
+
+/* 5 high-order bits in every field are reserved */
+#define PAT_FIELD_RSV_BITS			(0xF8UL)
 
 #ifndef ASSEMBLER
-static inline bool pat_mem_type_invalid(uint64_t x)
+static inline bool is_pat_mem_type_invalid(uint64_t x)
 {
-	return ((x & ~0x7UL) != 0UL || (x & 0x6UL) == 0x2UL);
+	return (((x & PAT_FIELD_RSV_BITS) != 0UL) || ((x & 0x6UL) == 0x2UL));
 }
 
 static inline bool is_x2apic_msr(uint32_t msr)
 {
-	bool ret = false;
 	/*
 	 * if msr is in the range of x2APIC MSRs
 	 */
-	if ((msr >= MSR_IA32_EXT_XAPICID) && (msr <= MSR_IA32_EXT_APIC_SELF_IPI)) {
-		ret = true;
-	}
-	return ret;
+	return ((msr >= 0x800U) && (msr < 0x900U));
 }
 
-static inline bool is_x2apic_read_only_msr(uint32_t msr)
-{
-	bool ret = false;
+struct acrn_vcpu;
 
-	if ((msr == MSR_IA32_EXT_XAPICID) ||
-		(msr == MSR_IA32_EXT_APIC_VERSION) ||
-		(msr == MSR_IA32_EXT_APIC_PPR) ||
-		(msr == MSR_IA32_EXT_APIC_LDR) ||
-		((msr >= MSR_IA32_EXT_APIC_ISR0) &&
-		(msr <= MSR_IA32_EXT_APIC_IRR7)) ||
-		(msr == MSR_IA32_EXT_APIC_CUR_COUNT)) {
-		ret = true;
-	}
-	return ret;
-}
+void init_msr_emulation(struct acrn_vcpu *vcpu);
+uint32_t vmsr_get_guest_msr_index(uint32_t msr);
+void update_msr_bitmap_x2apic_apicv(struct acrn_vcpu *vcpu);
+void update_msr_bitmap_x2apic_passthru(struct acrn_vcpu *vcpu);
 
-static inline bool is_x2apic_write_only_msr(uint32_t msr)
-{
-	bool ret = false;
-	if ((msr == MSR_IA32_EXT_APIC_EOI) || (msr == MSR_IA32_EXT_APIC_SELF_IPI)) {
-		ret = true;
-	}
-	return ret;
-}
 #endif /* ASSEMBLER */
-
-/* 5 high-order bits in every field are reserved */
-#define PAT_FIELD_RSV_BITS			(0xF8U)
 
 #define PAT_POWER_ON_VALUE	(PAT_MEM_TYPE_WB + \
 	(PAT_MEM_TYPE_WT << 8U) + \
@@ -633,26 +649,15 @@ static inline bool is_x2apic_write_only_msr(uint32_t msr)
 #define PRED_SET_IBPB				(1U << 0U)
 
 /* IA32 ARCH Capabilities bit */
-#define IA32_ARCH_CAP_RDCL_NO			(1U << 0U)
-#define IA32_ARCH_CAP_IBRS_ALL			(1U << 1U)
-#define IA32_ARCH_CAP_RSBA			(1U << 2U)
-#define IA32_ARCH_CAP_SKIP_L1DFL_VMENTRY	(1U << 3U)
-#define IA32_ARCH_CAP_SSB_NO			(1U << 4U)
+#define IA32_ARCH_CAP_RDCL_NO			(1UL << 0U)
+#define IA32_ARCH_CAP_IBRS_ALL			(1UL << 1U)
+#define IA32_ARCH_CAP_RSBA			(1UL << 2U)
+#define IA32_ARCH_CAP_SKIP_L1DFL_VMENTRY	(1UL << 3U)
+#define IA32_ARCH_CAP_SSB_NO			(1UL << 4U)
+#define IA32_ARCH_CAP_MDS_NO			(1UL << 5U)
+#define IA32_ARCH_CAP_IF_PSCHANGE_MC_NO		(1UL << 6U)
 
 /* Flush L1 D-cache */
 #define IA32_L1D_FLUSH				(1UL << 0U)
-
-/* MSR_IA32_MISC_ENABLE */
-#define MISC_ENABLE_FAST_STRING			(1U << 0U)
-#define MISC_ENABLE_TCC				(1U << 3U)
-#define MISC_ENABLE_PMA				(1U << 7U)
-#define MISC_ENABLE_BTS_UNAVAIL			(1U << 11U)
-#define MISC_ENABLE_PEBS_UNAVAIL		(1U << 12U)
-#define MISC_ENABLE_TM2_ENABLE			(1U << 13U)
-#define MISC_ENABLE_EITS			(1U << 16U)
-#define MISC_ENABLE_MONITOR_ENA			(1U << 18U)
-#define MISC_ENABLE_LIMIT_CPUID			(1U << 22U)
-#define MISC_ENABLE_xTPR			(1U << 23U)
-#define MISC_ENABLE_XD				(1U << 34U)
 
 #endif /* MSR_H */

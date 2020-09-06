@@ -4,16 +4,31 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <hypervisor.h>
-#include "uart16550.h"
+#include <types.h>
+#include <pci.h>
+#include <uart16550.h>
+#include <shell.h>
+#include <timer.h>
+#include <vuart.h>
+#include <logmsg.h>
+#include <acrn_hv_defs.h>
+#include <vm.h>
+#include <console.h>
 
 struct hv_timer console_timer;
 
 #define CONSOLE_KICK_TIMER_TIMEOUT  40UL /* timeout is 40ms*/
+/* Switching key combinations for shell and uart console */
+#define GUEST_CONSOLE_TO_HV_SWITCH_KEY      0       /* CTRL + SPACE */
+uint16_t console_vmid = ACRN_INVALID_VMID;
 
 void console_init(void)
 {
-	uart16550_init();
+	/*
+	 * Enable UART as early as possible.
+	 * Then we could use printf for debugging on early boot stage.
+	 */
+	uart16550_init(true);
 }
 
 void console_putc(const char *ch)
@@ -30,6 +45,68 @@ size_t console_write(const char *s, size_t len)
 char console_getc(void)
 {
 	return uart16550_getc();
+}
+
+/*
+ * @post return != NULL
+ */
+struct acrn_vuart *vm_console_vuart(struct acrn_vm *vm)
+{
+	return &vm->vuart[0];
+}
+
+/**
+ * @pre vu != NULL
+ * @pre vu->active == true
+ */
+static void vuart_console_rx_chars(struct acrn_vuart *vu)
+{
+	char ch = -1;
+
+	/* Get data from physical uart */
+	ch = uart16550_getc();
+
+	if (ch == GUEST_CONSOLE_TO_HV_SWITCH_KEY) {
+		/* Switch the console */
+		console_vmid = ACRN_INVALID_VMID;
+		printf("\r\n\r\n ---Entering ACRN SHELL---\r\n");
+	}
+	if (ch != -1) {
+		vuart_putchar(vu, ch);
+		vuart_toggle_intr(vu);
+	}
+
+}
+
+/**
+ * @pre vu != NULL
+ */
+static void vuart_console_tx_chars(struct acrn_vuart *vu)
+{
+	char c = vuart_getchar(vu);
+
+	while(c != -1) {
+		printf("%c", c);
+		c = vuart_getchar(vu);
+	}
+}
+
+static struct acrn_vuart *vuart_console_active(void)
+{
+	struct acrn_vm *vm = NULL;
+	struct acrn_vuart *vu = NULL;
+
+	if (console_vmid < CONFIG_MAX_VM_NUM) {
+		vm = get_vm_from_vmid(console_vmid);
+		if (!is_poweroff_vm(vm)) {
+			vu = vm_console_vuart(vm);
+		} else {
+			/* Console vm is invalid, switch back to HV-Shell */
+			console_vmid = ACRN_INVALID_VMID;
+		}
+	}
+
+	return ((vu != NULL) && vu->active) ? vu : NULL;
 }
 
 static void console_timer_callback(__unused void *data)

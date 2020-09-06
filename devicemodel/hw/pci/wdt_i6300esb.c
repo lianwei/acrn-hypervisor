@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <stdbool.h>
 
 #include "vmmapi.h"
@@ -136,7 +135,15 @@ wdt_expired_handler(void *arg, uint64_t nexp)
 			wdt_timeout = 1;
 
 			/* watchdog timer out, set the uos to reboot */
+#ifdef DM_DEBUG
+			pr_info("%s: setting VM state to %s\n", __func__, vm_state_to_str(VM_SUSPEND_SYSTEM_RESET));
+			vm_set_suspend_mode(VM_SUSPEND_SYSTEM_RESET);
+			/* Notify vm thread to handle VM_SUSPEND_SYSTEM_RESET request */
+			notify_vmloop_thread();
+#else
+			pr_info("%s: setting VM state to %s\n", __func__, vm_state_to_str(VM_SUSPEND_FULL_RESET));
 			vm_set_suspend_mode(VM_SUSPEND_FULL_RESET);
+#endif
 			mevent_notify();
 		} else {
 			/* if not need reboot, just loop timer */
@@ -182,7 +189,7 @@ start_wdt_timer(void)
 	timer_val.it_value.tv_sec = seconds;
 
 	if (acrn_timer_settime(&wdt_state.timer, &timer_val) == -1) {
-		perror("WDT timerfd_settime failed.\n");
+		pr_err("WDT timerfd_settime failed.\n");
 		wdt_state.wdt_armed = false;
 		return;
 	}
@@ -246,8 +253,6 @@ static void
 pci_wdt_bar_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		  int baridx, uint64_t offset, int size, uint64_t value)
 {
-	assert(baridx == 0);
-
 	DPRINTF("%s: addr = 0x%x, val = 0x%x, size=%d\n",
 		__func__, (int) offset, (int)value, size);
 
@@ -263,7 +268,8 @@ pci_wdt_bar_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 			}
 		}
 	} else if (offset == ESB_RELOAD_REG) {
-		assert(size == 2);
+		if (size != 2)
+			return;
 
 		if (value == ESB_UNLOCK1)
 			wdt_state.unlock_state = 1;
@@ -300,7 +306,6 @@ pci_wdt_bar_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 {
 	uint64_t ret = 0;
 
-	assert(baridx == 0);
 	DPRINTF("%s: addr = 0x%x, size=%d\n\r", __func__, (int) offset, size);
 
 	if (offset == ESB_GIS_REG) {
@@ -309,7 +314,8 @@ pci_wdt_bar_read(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 			ret |= ESB_WDT_INT_ACT;
 
 	} else if (offset == ESB_RELOAD_REG) {
-		assert(size == 2);
+		if (size != 2)
+			return 0;
 
 		DPRINTF("%s: timeout: %d\n\r", __func__, wdt_timeout);
 		if (wdt_timeout != 0)
@@ -327,7 +333,7 @@ pci_wdt_init(struct vmctx *ctx, struct pci_vdev *dev, char *opts)
 {
 	/*the wdt just has one inistance */
 	if (wdt_state.reboot_enabled && wdt_state.timer1_val) {
-		perror("wdt can't be initialized twice, please check!");
+		pr_err("wdt can't be initialized twice, please check!");
 		return -1;
 	}
 

@@ -9,7 +9,12 @@
 
 #ifdef PROFILING_ON
 
-#define MAX_MSR_LIST_NUM	15U
+#include <vcpu.h>
+#include <vm_config.h>
+
+#define MAX_MSR_LIST_NUM		15U
+#define MAX_PROFILING_MSR_STORE_NUM	1
+#define MAX_HV_MSR_LIST_NUM		(MSR_AREA_COUNT)
 #define MAX_GROUP_NUM		1U
 
 #define COLLECT_PROFILE_DATA	0
@@ -106,10 +111,10 @@ struct profiling_vcpu_pcpu_map {
 
 struct profiling_vm_info {
 	uint16_t vm_id_num;
-	uint8_t guid[16];
+	uint8_t uuid[16];
 	char vm_name[16];
 	uint16_t num_vcpus;
-	struct profiling_vcpu_pcpu_map cpu_map[CONFIG_MAX_VCPUS_PER_VM];
+	struct profiling_vcpu_pcpu_map cpu_map[MAX_VCPUS_PER_VM];
 };
 
 struct profiling_vm_info_list {
@@ -158,12 +163,6 @@ struct profiling_vmsw_config {
 	struct profiling_msr_op exit_list[MAX_MSR_LIST_NUM];
 };
 
-struct vmexit_msr {
-	uint32_t msr_idx;
-	uint32_t reserved;
-	uint64_t msr_data;
-};
-
 struct guest_vm_info {
 	uint64_t vmenter_tsc;
 	uint64_t vmexit_tsc;
@@ -174,6 +173,12 @@ struct guest_vm_info {
 	uint16_t guest_vm_id;
 	int32_t external_vector;
 };
+
+struct profiling_status {
+	uint32_t samples_logged;
+	uint32_t samples_dropped;
+};
+
 struct sep_state {
 	sep_pmu_state pmu_state;
 
@@ -210,8 +215,8 @@ struct sep_state {
 	uint32_t frozen_delayed;
 	uint32_t nofrozen_pmi;
 
-	struct vmexit_msr vmexit_msr_list[MAX_MSR_LIST_NUM];
-	int32_t vmexit_msr_cnt;
+	struct msr_store_entry vmexit_msr_list[MAX_PROFILING_MSR_STORE_NUM + MAX_HV_MSR_LIST_NUM];
+	uint32_t vmexit_msr_cnt;
 	uint64_t guest_debugctl_value;
 	uint64_t saved_debugctl_value;
 } __aligned(8);
@@ -285,13 +290,13 @@ struct vm_switch_trace {
  */
 struct profiling_info_wrapper {
 	struct profiling_msr_ops_list *msr_node;
-	struct sep_state sep_state;
+	struct sep_state s_state;
 	struct guest_vm_info vm_info;
 	ipi_commands ipi_cmd;
-	struct pmu_sample pmu_sample;
-	struct vm_switch_trace vm_switch_trace;
+	struct pmu_sample p_sample;
+	struct vm_switch_trace vm_trace;
 	socwatch_state soc_state;
-	struct sw_msr_op_info sw_msr_op_info;
+	struct sw_msr_op_info sw_msr_info;
 	spinlock_t sw_lock;
 } __aligned(8);
 
@@ -304,6 +309,7 @@ int32_t profiling_set_control(struct acrn_vm *vm, uint64_t addr);
 int32_t profiling_configure_pmi(struct acrn_vm *vm, uint64_t addr);
 int32_t profiling_configure_vmsw(struct acrn_vm *vm, uint64_t addr);
 void profiling_ipi_handler(void *data);
+int32_t profiling_get_status_info(struct acrn_vm *vm, uint64_t addr);
 
 #endif
 

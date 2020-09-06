@@ -206,11 +206,14 @@ enum {
 #define	VIRTIO_TYPE_HYPERDMABUF	0xFFFA
 #define	VIRTIO_TYPE_HDCP	0xFFF9
 #define	VIRTIO_TYPE_COREU	0xFFF8
+#define	VIRTIO_TYPE_GPIO	0xFFF7
+#define	VIRTIO_TYPE_I2C		0xFFF6
 
 /*
  * PCI vendor/device IDs
  */
 #define	INTEL_VENDOR_ID		0x8086
+#define	ORACLE_VENDOR_ID	0x108E
 #define	VIRTIO_VENDOR		0x1AF4
 #define	VIRTIO_DEV_NET		0x1000
 #define	VIRTIO_DEV_BLOCK	0x1001
@@ -228,6 +231,8 @@ enum {
 #define	VIRTIO_DEV_HYPERDMABUF	0x8606
 #define	VIRTIO_DEV_HDCP		0x8607
 #define	VIRTIO_DEV_COREU	0x8608
+#define	VIRTIO_DEV_GPIO		0x8609
+#define VIRTIO_DEV_I2C		0x860a
 
 /*
  * VIRTIO_CONFIG_S_NEEDS_RESET is not defined
@@ -452,24 +457,24 @@ struct virtio_vq_info {
  *
  * @param vq Pointer to struct virtio_vq_info.
  *
- * @return 0 on not ready and 1 on ready.
+ * @return false on not ready and true on ready.
  */
-static inline int
+static inline bool
 vq_ring_ready(struct virtio_vq_info *vq)
 {
-	return (vq->flags & VQ_ALLOC);
+	return ((vq->flags & VQ_ALLOC) == VQ_ALLOC);
 }
 
 /**
  * @brief Are there "available" descriptors?
  *
- * This does not count how many, just returns 1 if there is any.
+ * This does not count how many, just returns true if there is any.
  *
  * @param vq Pointer to struct virtio_vq_info.
  *
- * @return 0 on no available and 1 on available.
+ * @return false on not available and true on available.
  */
-static inline int
+static inline bool
 vq_has_descs(struct virtio_vq_info *vq)
 {
 	return (vq_ring_ready(vq) && vq->last_avail !=
@@ -715,19 +720,6 @@ void virtio_pci_write(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
 		      int baridx, uint64_t offset, int size, uint64_t value);
 
 /**
- * @brief Indicate the device has experienced an error.
- *
- * This is called when the device has experienced an error from which it
- * cannot re-cover. DEVICE_NEEDS_RESET is set to the device status register
- * and a config change intr is sent to the guest driver.
- *
- * @param base Pointer to struct virtio_base.
- *
- * @return None
- */
-void virtio_dev_error(struct virtio_base *base);
-
-/**
  * @brief Set modern BAR (usually 4) to map PCI config registers.
  *
  * Set modern MMIO BAR (usually 4) to map virtio 1.0 capabilities and optional
@@ -740,44 +732,6 @@ void virtio_dev_error(struct virtio_base *base);
  * @return 0 on success and non-zero on fail.
  */
 int virtio_set_modern_bar(struct virtio_base *base, bool use_notify_pio);
-
-/**
- * @brief Handle PCI configuration space reads.
- *
- * Handle virtio PCI configuration space reads. Only the specific registers
- * that need speical operation are handled in this callback. For others just
- * fallback to pci core. This interface is only valid for virtio modern.
- *
- * @param ctx Pointer to struct vmctx representing VM context.
- * @param vcpu VCPU ID.
- * @param dev Pointer to struct pci_vdev which emulates a PCI device.
- * @param coff Register offset in bytes within PCI configuration space.
- * @param bytes Access range in bytes.
- * @param rv The value returned as read.
- *
- * @return 0 on handled and non-zero on non-handled.
- */
-int virtio_pci_modern_cfgread(struct vmctx *ctx, int vcpu, struct pci_vdev *dev,
-			      int coff, int bytes, uint32_t *rv);
-/**
- * @brief Handle PCI configuration space writes.
- *
- * Handle virtio PCI configuration space writes. Only the specific registers
- * that need speical operation are handled in this callback. For others just
- * fallback to pci core. This interface is only valid for virtio modern.
- *
- * @param ctx Pointer to struct vmctx representing VM context.
- * @param vcpu VCPU ID.
- * @param dev Pointer to struct pci_vdev which emulates a PCI device.
- * @param coff Register offset in bytes within PCI configuration space.
- * @param bytes Access range in bytes.
- * @param val The value to write.
- *
- * @return 0 on handled and non-zero on non-handled.
- */
-int virtio_pci_modern_cfgwrite(struct vmctx *ctx, int vcpu,
-			       struct pci_vdev *dev, int coff, int bytes,
-			       uint32_t val);
 
 /**
  * @}

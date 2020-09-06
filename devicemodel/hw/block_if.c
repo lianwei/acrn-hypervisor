@@ -33,7 +33,6 @@
 #include <linux/falloc.h>
 #include <linux/fs.h>
 #include <errno.h>
-#include <assert.h>
 #include <err.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -47,6 +46,7 @@
 #include "block_if.h"
 #include "ahci.h"
 #include "dm_string.h"
+#include "log.h"
 
 /*
  * Notes:
@@ -98,7 +98,6 @@ struct blockif_elem {
 };
 
 struct blockif_ctxt {
-	int			magic;
 	int			fd;
 	int			isblk;
 	int			candiscard;
@@ -151,7 +150,6 @@ blockif_flush_cache(struct blockif_ctxt *bc)
 	int err;
 
 	err = 0;
-	assert(bc != NULL);
 	if (!bc->wce) {
 		if (fsync(bc->fd))
 			err = errno;
@@ -168,8 +166,10 @@ blockif_enqueue(struct blockif_ctxt *bc, struct blockif_req *breq,
 	int i;
 
 	be = TAILQ_FIRST(&bc->freeq);
-	assert(be != NULL);
-	assert(be->status == BST_FREE);
+	if (be == NULL || be->status != BST_FREE) {
+		WPRINTF(("%s: failed to get element from freeq\n", __func__));
+		return 0;
+	}
 	TAILQ_REMOVE(&bc->freeq, be, link);
 	be->req = breq;
 	be->op = op;
@@ -212,7 +212,6 @@ blockif_dequeue(struct blockif_ctxt *bc, pthread_t t, struct blockif_elem **bep)
 	TAILQ_FOREACH(be, &bc->pendq, link) {
 		if (be->status == BST_PEND)
 			break;
-		assert(be->status == BST_BLOCK);
 	}
 	if (be == NULL)
 		return 0;
@@ -480,7 +479,7 @@ sub_file_unlock(struct blockif_ctxt *bc)
 		DPRINTF(("blockif: release file lock...\n"));
 		fl->l_type = F_UNLCK;
 		if (fcntl(bc->fd, F_OFD_SETLK, fl) == -1) {
-			fprintf(stderr, "blockif: failed to unlock subfile!\n");
+			pr_err("blockif: failed to unlock subfile!\n");
 			exit(1);
 		}
 		DPRINTF(("blockif: release done\n"));
@@ -581,7 +580,7 @@ blockif_open(const char *optstr, const char *ident)
 			else
 				goto err;
 		} else {
-			fprintf(stderr, "Invalid device option \"%s\"\n", cp);
+			pr_err("Invalid device option \"%s\"\n", cp);
 			goto err;
 		}
 	}
@@ -621,7 +620,7 @@ blockif_open(const char *optstr, const char *ident)
 		/* get size */
 		err_code = ioctl(fd, BLKGETSIZE, &sz);
 		if (err_code) {
-			fprintf(stderr, "error %d getting block size!\n",
+			pr_err("error %d getting block size!\n",
 				err_code);
 			size = sbuf.st_size;	/* set default value */
 		} else {
@@ -643,7 +642,7 @@ blockif_open(const char *optstr, const char *ident)
 		/* get physical sector size */
 		err_code = ioctl(fd, BLKPBSZGET, &psectsz);
 		if (err_code) {
-			fprintf(stderr, "error %d getting physical sectsz!\n",
+			pr_err("error %d getting physical sectsz!\n",
 				err_code);
 			psectsz = DEV_BSIZE;  /* set default physical size */
 		}
@@ -662,7 +661,7 @@ blockif_open(const char *optstr, const char *ident)
 		if (size < DEV_BSIZE || (size & (DEV_BSIZE - 1))) {
 			WPRINTF(("%s size not corret, should be multiple of %d\n",
 						nopt, DEV_BSIZE));
-			return 0;
+			goto err;
 		}
 		psectsz = sbuf.st_blksize;
 	}
@@ -670,7 +669,7 @@ blockif_open(const char *optstr, const char *ident)
 	if (ssopt != 0) {
 		if (!powerof2(ssopt) || !powerof2(pssopt) || ssopt < 512 ||
 		    ssopt > pssopt) {
-			fprintf(stderr, "Invalid sector size %d/%d\n",
+			pr_err("Invalid sector size %d/%d\n",
 			    ssopt, pssopt);
 			goto err;
 		}
@@ -684,8 +683,7 @@ blockif_open(const char *optstr, const char *ident)
 		 */
 		if (S_ISCHR(sbuf.st_mode)) {
 			if (ssopt < sectsz || (ssopt % sectsz) != 0) {
-				fprintf(stderr,
-				"Sector size %d incompatible with underlying device sector size %d\n",
+				pr_err("Sector size %d incompatible with underlying device sector size %d\n",
 				    ssopt, sectsz);
 				goto err;
 			}
@@ -698,7 +696,7 @@ blockif_open(const char *optstr, const char *ident)
 
 	bc = calloc(1, sizeof(struct blockif_ctxt));
 	if (bc == NULL) {
-		perror("calloc");
+		pr_err("calloc");
 		goto err;
 	}
 
@@ -711,7 +709,7 @@ blockif_open(const char *optstr, const char *ident)
 		err_code = sub_file_validate(bc, fd, ro, bc->sub_file_start_lba,
 					     size);
 		if (err_code < 0) {
-			fprintf(stderr, "subfile range specified not valid!\n");
+			pr_err("subfile range specified not valid!\n");
 			exit(1);
 		}
 		DPRINTF(("Validated done!\n"));
@@ -721,7 +719,6 @@ blockif_open(const char *optstr, const char *ident)
 		bc->sub_file_start_lba = 0;
 	}
 
-	bc->magic = BLOCKIF_SIG;
 	bc->fd = fd;
 	bc->isblk = S_ISBLK(sbuf.st_mode);
 	bc->candiscard = candiscard;
@@ -753,14 +750,24 @@ blockif_open(const char *optstr, const char *ident)
 	for (i = 0; i < BLOCKIF_NUMTHR; i++) {
 		if (snprintf(tname, sizeof(tname), "blk-%s-%d",
 					ident, i) >= sizeof(tname)) {
-			perror("blk thread name too long");
+			pr_err("blk thread name too long");
 		}
 		pthread_create(&bc->btid[i], NULL, blockif_thr, bc);
 		pthread_setname_np(bc->btid[i], tname);
 	}
 
+	/* free strdup memory */
+	if (nopt) {
+		free(nopt);
+		nopt = NULL;
+	}
+
 	return bc;
 err:
+	/* handle failure case: free strdup memory*/
+	if (nopt)
+		free(nopt);
+
 	if (fd >= 0)
 		close(fd);
 	return NULL;
@@ -799,28 +806,24 @@ blockif_request(struct blockif_ctxt *bc, struct blockif_req *breq,
 int
 blockif_read(struct blockif_ctxt *bc, struct blockif_req *breq)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return blockif_request(bc, breq, BOP_READ);
 }
 
 int
 blockif_write(struct blockif_ctxt *bc, struct blockif_req *breq)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return blockif_request(bc, breq, BOP_WRITE);
 }
 
 int
 blockif_flush(struct blockif_ctxt *bc, struct blockif_req *breq)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return blockif_request(bc, breq, BOP_FLUSH);
 }
 
 int
 blockif_discard(struct blockif_ctxt *bc, struct blockif_req *breq)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return blockif_request(bc, breq, BOP_DISCARD);
 }
 
@@ -828,8 +831,6 @@ int
 blockif_cancel(struct blockif_ctxt *bc, struct blockif_req *breq)
 {
 	struct blockif_elem *be;
-
-	assert(bc->magic == BLOCKIF_SIG);
 
 	pthread_mutex_lock(&bc->mtx);
 	/*
@@ -907,7 +908,6 @@ blockif_close(struct blockif_ctxt *bc)
 	void *jval;
 	int i;
 
-	assert(bc->magic == BLOCKIF_SIG);
 	sub_file_unlock(bc);
 
 	/*
@@ -915,8 +915,9 @@ blockif_close(struct blockif_ctxt *bc)
 	 */
 	pthread_mutex_lock(&bc->mtx);
 	bc->closing = 1;
-	pthread_mutex_unlock(&bc->mtx);
 	pthread_cond_broadcast(&bc->cond);
+	pthread_mutex_unlock(&bc->mtx);
+
 	for (i = 0; i < BLOCKIF_NUMTHR; i++)
 		pthread_join(bc->btid[i], &jval);
 
@@ -925,7 +926,6 @@ blockif_close(struct blockif_ctxt *bc)
 	/*
 	 * Release resources
 	 */
-	bc->magic = 0;
 	close(bc->fd);
 	free(bc);
 
@@ -943,8 +943,6 @@ blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s)
 	off_t hcyl;		/* cylinders times heads */
 	uint16_t secpt;		/* sectors per track */
 	uint8_t heads;
-
-	assert(bc->magic == BLOCKIF_SIG);
 
 	sectors = bc->size / bc->sectsz;
 
@@ -987,21 +985,18 @@ blockif_chs(struct blockif_ctxt *bc, uint16_t *c, uint8_t *h, uint8_t *s)
 off_t
 blockif_size(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->size;
 }
 
 int
 blockif_sectsz(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->sectsz;
 }
 
 void
 blockif_psectsz(struct blockif_ctxt *bc, int *size, int *off)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	*size = bc->psectsz;
 	*off = bc->psectoff;
 }
@@ -1009,56 +1004,48 @@ blockif_psectsz(struct blockif_ctxt *bc, int *size, int *off)
 int
 blockif_queuesz(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return (BLOCKIF_MAXREQ - 1);
 }
 
 int
 blockif_is_ro(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->rdonly;
 }
 
 int
 blockif_candiscard(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->candiscard;
 }
 
 int
 blockif_max_discard_sectors(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->max_discard_sectors;
 }
 
 int
 blockif_max_discard_seg(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->max_discard_seg;
 }
 
 int
 blockif_discard_sector_alignment(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->discard_sector_alignment;
 }
 
 uint8_t
 blockif_get_wce(struct blockif_ctxt *bc)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	return bc->wce;
 }
 
 void
 blockif_set_wce(struct blockif_ctxt *bc, uint8_t wce)
 {
-	assert(bc->magic == BLOCKIF_SIG);
 	bc->wce = wce;
 }
 
@@ -1068,7 +1055,6 @@ blockif_flush_all(struct blockif_ctxt *bc)
 	int err;
 
 	err=0;
-	assert(bc->magic == BLOCKIF_SIG);
 	if (fsync(bc->fd))
 		err = errno;
 	return err;
